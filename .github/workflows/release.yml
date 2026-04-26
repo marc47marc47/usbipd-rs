@@ -1,0 +1,129 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive_ext: zip
+            bin: usbipd-rs.exe
+          - label: macos-aarch64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+            archive_ext: tar.gz
+            bin: usbipd-rs
+          - label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive_ext: tar.gz
+            bin: usbipd-rs
+          - label: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            archive_ext: tar.gz
+            bin: usbipd-rs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Bundled drivers in windows-driver/ are large (~30 MB) but harmless
+          # for the build itself. Keep full checkout — release packaging may
+          # bundle them later.
+          fetch-depth: 1
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+        # For reproducible builds, commit Cargo.lock and add `--locked` here.
+        # Currently Cargo.lock is gitignored — CI resolves deps fresh per run.
+
+      - name: Strip binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: strip target/${{ matrix.target }}/release/${{ matrix.bin }} || true
+
+      - name: Stage release artifact
+        shell: bash
+        run: |
+          set -e
+          STAGING="usbipd-rs-${{ matrix.label }}"
+          mkdir -p "$STAGING"
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} "$STAGING/"
+          # Always include README/license so the archive is self-contained.
+          [ -f README.md ] && cp README.md "$STAGING/" || true
+          [ -f LICENSE ]   && cp LICENSE   "$STAGING/" || true
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            7z a -tzip "${STAGING}.zip" "$STAGING"
+            echo "ARCHIVE=${STAGING}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${STAGING}.tar.gz" "$STAGING"
+            echo "ARCHIVE=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+          fi
+          ls -la "${STAGING}".*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List collected artifacts
+        run: ls -la artifacts/
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
