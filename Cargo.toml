@@ -3,6 +3,9 @@ name = "usbipd-rs"
 version = "0.3.0"
 edition = "2021"
 description = "List connected USB hardware in usbipd-list format (with nusb enrichment)."
+license = "GPL-3.0-only"
+repository = "https://github.com/marc47marc47/usbipd-rs"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

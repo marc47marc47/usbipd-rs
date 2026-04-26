@@ -192,6 +192,5 @@ fan out into multiple probe back-ends. The micro:bit entry uses
 
 ## License
 
-Not yet declared. If you plan to redistribute, open an issue / PR with
-the license you'd like (MIT and Apache-2.0 are the typical defaults for
-Rust projects).
+[GPL-3.0-only](LICENSE). You're free to use, modify, and redistribute,
+provided derivative works are also released under GPL-3.0.

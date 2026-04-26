@@ -98,6 +98,10 @@ fn main() -> Result<()> {
         print_help();
         return Ok(());
     }
+    if args.iter().any(|a| matches!(a.as_str(), "-V" | "--version")) {
+        println!("usbipd-rs {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--list-tools") {
         return cmd_list_tools();
     }
@@ -121,6 +125,7 @@ USAGE:
     usbipd-rs --list-tools          Show install status of all probe-tool dependencies.
     usbipd-rs --install <ID>        Download/install one tool by its ID.
     usbipd-rs --help                Show this help.
+    usbipd-rs --version             Print the program version and exit.
 
 OPTIONS:
     -p, --probe                Probe each detected board with the matching chip-level
@@ -130,6 +135,7 @@ OPTIONS:
                                brew / apt / download) and install status.
         --install <ID>         Install one tool by ID. See --list-tools for IDs.
     -h, --help                 Show this help.
+    -V, --version              Print version (from Cargo.toml) and exit.
 
 WHAT GETS DETECTED (VID:PID → board → probe):
     10C4:EA60 / EA70 / EA71      Silabs CP210x bridge       → ESP32 (espflash)
