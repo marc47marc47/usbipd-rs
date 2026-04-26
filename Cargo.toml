@@ -1,0 +1,15 @@
+[package]
+name = "usbipd-rs"
+version = "0.1.0"
+edition = "2021"
+description = "List connected USB hardware in usbipd-list format (with nusb enrichment)."
+
+[dependencies]
+anyhow = "1"
+nusb = "0.1"
+serialport = "4"
+unicode-width = "0.2"
+
+[[bin]]
+name = "usbipd-rs"
+path = "src/bin/usbipd-rs.rs"
