@@ -1,0 +1,46 @@
+整合與錯誤提示都運作正常 — 程式正確找到 picotool（從 windows-driver/picotool/picotool.exe）、傳對的 --vid 0x2e8a --pid 0x0003、抓到 picotool 的真實錯誤訊息、附上 Zadig 安裝步驟。
+
+  現在卡在 Windows 驅動：picotool 看到 BOOTSEL 裝置但無法連線 PICOBOOT vendor interface（Windows 預設沒 driver）。
+
+  你需要做的最後一步
+
+  按程式提示走一次 Zadig：
+
+  1. 下載 Zadig：https://zadig.akeo.ie/
+  2. 以管理員身分執行 Zadig
+  3. Options → 勾 List All Devices
+  4. 在下拉選單找 RP2 Boot（或類似名稱，VID=2E8A）
+  5. 重點：右邊驅動選 WinUSB（不是 USB Mass Storage），點 Replace Driver
+  6. 等它跑完（會花幾秒到 30 秒）
+  7. 不需要拔插 Pi Pico，直接重跑：
+  ./target/release/usbipd-rs.exe --probe
+
+  預期輸出：
+
+  [1-11  RP2040 BOOTSEL (Pi Pico)  (via libusb)  via picotool]
+    Board:               RP2040 BOOTSEL (Pi Pico)
+    Chip:                RP2040
+    Chip revision:       B2
+    Flash size:          2048K
+    ROM version:         3
+    Unique ID:           E66160...
+
+  為什麼 Pi Pico 比 ESP32/Arduino 麻煩？
+
+  ┌─────────────────┬─────────────────────────────────────┬───────────────────────────────┐
+  │      平台       │            USB 互動模式             │           驅動需求            │
+  ├─────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ ESP32 (CP2102)  │ USB-CDC 序列埠                      │ 標準 VCP（Silabs 驅動，已裝） │
+  ├─────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ Arduino Uno     │ USB-CDC 序列埠 (16U2)               │ Windows 內建                  │
+  ├─────────────────┼─────────────────────────────────────┼───────────────────────────────┤
+  │ Pi Pico BOOTSEL │ PICOBOOT vendor interface（非標準） │ 需 WinUSB（Zadig）            │
+  └─────────────────┴─────────────────────────────────────┴───────────────────────────────┘
+
+  Pi Pico 的 BOOTSEL 模式不是 CDC，是自訂 USB 協定，所以 Windows 沒對應的驅動。一旦 Zadig 把它換成 WinUSB，picotool/libusb 就能直接讀。
+
+  注意副作用：替換驅動後，Pi Pico 在 BOOTSEL 模式不會再被 Windows 認成 USB 隨身碟（無法直接拖 UF2 上去）。如果你想恢復 UF2 拖拉模式，要在 Zadig 把 driver 換回 usbccgp
+  或從裝置管理員「卸載驅動程式 → 拔插」。實務上常用 picotool 燒錄 取代拖拉 UF2，反正都有 picotool 了。
+
+  Zadig 跑完告訴我結果，我們來看完整的 RP2040 規格輸出。
+
