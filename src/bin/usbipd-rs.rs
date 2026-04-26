@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use unicode_width::UnicodeWidthStr;
 
@@ -15,11 +16,13 @@ enum ProbeKind {
         baud: u32,
     },
     Picotool,
+    Daplink,
+    Pyocd,
 }
 
 impl ProbeKind {
     fn needs_serial_port(&self) -> bool {
-        !matches!(self, ProbeKind::Picotool)
+        matches!(self, ProbeKind::Espflash | ProbeKind::Avrdude { .. })
     }
 
     fn tool_name(&self) -> &'static str {
@@ -27,6 +30,8 @@ impl ProbeKind {
             ProbeKind::Espflash => "espflash",
             ProbeKind::Avrdude { .. } => "avrdude",
             ProbeKind::Picotool => "picotool",
+            ProbeKind::Daplink => "DETAILS.TXT",
+            ProbeKind::Pyocd => "pyocd",
         }
     }
 }
@@ -35,41 +40,51 @@ struct KnownBoard {
     vid: u16,
     pid: u16,
     name: &'static str,
-    probe: ProbeKind,
+    probes: &'static [ProbeKind],
 }
+
+// Reusable probe pipelines
+const ESP: &[ProbeKind] = &[ProbeKind::Espflash];
+const PICO: &[ProbeKind] = &[ProbeKind::Picotool];
+const DAP_PIPELINE: &[ProbeKind] = &[ProbeKind::Daplink, ProbeKind::Pyocd];
 
 const KNOWN_BOARDS: &[KnownBoard] = &[
     // ── Arduino official boards (probe via avrdude) ──────────────────────
     KnownBoard { vid: 0x2341, pid: 0x0001, name: "Arduino Uno R1",
-        probe: ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", baud: 115200 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", baud: 115200 }] },
     KnownBoard { vid: 0x2341, pid: 0x0043, name: "Arduino Uno R3",
-        probe: ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", baud: 115200 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", baud: 115200 }] },
     KnownBoard { vid: 0x2341, pid: 0x0010, name: "Arduino Mega 2560",
-        probe: ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 }] },
     KnownBoard { vid: 0x2341, pid: 0x0042, name: "Arduino Mega 2560 R3",
-        probe: ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 }] },
     KnownBoard { vid: 0x2341, pid: 0x0044, name: "Arduino Mega ADK",
-        probe: ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 }] },
     KnownBoard { vid: 0x2341, pid: 0x8036, name: "Arduino Leonardo",
-        probe: ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", baud: 57600 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", baud: 57600 }] },
     KnownBoard { vid: 0x2341, pid: 0x8037, name: "Arduino Micro",
-        probe: ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", baud: 57600 } },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", baud: 57600 }] },
 
     // ── ESP32 USB-UART bridges & native USB (probe via espflash) ─────────
-    KnownBoard { vid: 0x10c4, pid: 0xea60, name: "CP2102/CP2102N", probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x10c4, pid: 0xea70, name: "CP2105",         probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x10c4, pid: 0xea71, name: "CP2108",         probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x1a86, pid: 0x7523, name: "CH340",          probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x1a86, pid: 0x55d4, name: "CH9102",         probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x0403, pid: 0x6010, name: "FT2232",         probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x0403, pid: 0x6014, name: "FT232H",         probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x0403, pid: 0x6015, name: "FT231X",         probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x303a, pid: 0x1001, name: "ESP32 USB-Serial-JTAG", probe: ProbeKind::Espflash },
-    KnownBoard { vid: 0x303a, pid: 0x4001, name: "ESP32 USB-OTG",  probe: ProbeKind::Espflash },
+    KnownBoard { vid: 0x10c4, pid: 0xea60, name: "CP2102/CP2102N", probes: ESP },
+    KnownBoard { vid: 0x10c4, pid: 0xea70, name: "CP2105",         probes: ESP },
+    KnownBoard { vid: 0x10c4, pid: 0xea71, name: "CP2108",         probes: ESP },
+    KnownBoard { vid: 0x1a86, pid: 0x7523, name: "CH340",          probes: ESP },
+    KnownBoard { vid: 0x1a86, pid: 0x55d4, name: "CH9102",         probes: ESP },
+    KnownBoard { vid: 0x0403, pid: 0x6010, name: "FT2232",         probes: ESP },
+    KnownBoard { vid: 0x0403, pid: 0x6014, name: "FT232H",         probes: ESP },
+    KnownBoard { vid: 0x0403, pid: 0x6015, name: "FT231X",         probes: ESP },
+    KnownBoard { vid: 0x303a, pid: 0x1001, name: "ESP32 USB-Serial-JTAG", probes: ESP },
+    KnownBoard { vid: 0x303a, pid: 0x4001, name: "ESP32 USB-OTG",  probes: ESP },
 
     // ── Raspberry Pi Pico (RP2040 / RP2350) (probe via picotool) ─────────
-    KnownBoard { vid: 0x2e8a, pid: 0x0003, name: "RP2040 BOOTSEL (Pi Pico)",   probe: ProbeKind::Picotool },
-    KnownBoard { vid: 0x2e8a, pid: 0x000f, name: "RP2350 BOOTSEL (Pi Pico 2)", probe: ProbeKind::Picotool },
+    KnownBoard { vid: 0x2e8a, pid: 0x0003, name: "RP2040 BOOTSEL (Pi Pico)",   probes: PICO },
+    KnownBoard { vid: 0x2e8a, pid: 0x000f, name: "RP2350 BOOTSEL (Pi Pico 2)", probes: PICO },
+
+    // ── DAPLink-based boards (BBC micro:bit, NXP FRDM, etc.) ─────────────
+    // Read DETAILS.TXT from MSD first, then ask pyocd what target chip is on
+    // the other end of the SWD lines (board database lookup; no chip reset).
+    KnownBoard { vid: 0x0d28, pid: 0x0204, name: "DAPLink (mbed CMSIS-DAP)", probes: DAP_PIPELINE },
 ];
 
 fn lookup_board(vid: u16, pid: u16) -> Option<&'static KnownBoard> {
@@ -77,6 +92,103 @@ fn lookup_board(vid: u16, pid: u16) -> Option<&'static KnownBoard> {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        print_help();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--list-tools") {
+        return cmd_list_tools();
+    }
+    if let Some(idx) = args.iter().position(|a| a == "--install") {
+        let tool = args.get(idx + 1).map(String::as_str).unwrap_or("");
+        if tool.is_empty() {
+            anyhow::bail!("--install requires a tool name. Try `--list-tools`.");
+        }
+        return cmd_install(tool);
+    }
+
+    cmd_list_usb()
+}
+
+fn print_help() {
+    let help = r#"usbipd-rs — USB device inspector with chip-level board probing
+
+USAGE:
+    usbipd-rs                       List connected USB devices and detect probable boards.
+    usbipd-rs --probe               List, then probe each detected board (chip-level info).
+    usbipd-rs --list-tools          Show install status of all probe-tool dependencies.
+    usbipd-rs --install <ID>        Download/install one tool by its ID.
+    usbipd-rs --help                Show this help.
+
+OPTIONS:
+    -p, --probe                Probe each detected board with the matching chip-level
+                               tool (espflash, avrdude, picotool, DAPLink, pyocd).
+                               Aliases: --probe-esp, --probe-arduino.
+        --list-tools           List installable tools, their OS provider (cargo / pip /
+                               brew / apt / download) and install status.
+        --install <ID>         Install one tool by ID. See --list-tools for IDs.
+    -h, --help                 Show this help.
+
+WHAT GETS DETECTED (VID:PID → board → probe):
+    10C4:EA60 / EA70 / EA71      Silabs CP210x bridge       → ESP32 (espflash)
+    1A86:7523 / 55D4              WCH CH340 / CH9102         → ESP32 (espflash)
+    0403:6010 / 6014 / 6015       FTDI FT2232 / FT232H / X   → ESP32 (espflash)
+    303A:1001 / 4001              ESP32 native USB-Serial    → ESP32 (espflash)
+    2341:0001 / 0043              Arduino Uno R1 / R3        → AVR  (avrdude)
+    2341:0010 / 0042 / 0044       Arduino Mega 2560 / ADK    → AVR  (avrdude)
+    2341:8036 / 8037              Arduino Leonardo / Micro   → AVR  (avrdude)
+    2E8A:0003                     RP2040 BOOTSEL (Pi Pico)   → RP2  (picotool)
+    2E8A:000F                     RP2350 BOOTSEL (Pi Pico 2) → RP2  (picotool)
+    0D28:0204                     mbed CMSIS-DAP / DAPLink   → DAP+SWD (DETAILS.TXT + pyocd)
+
+INSTALLABLE TOOLS (see --list-tools for live status):
+    espflash    cargo install espflash         ESP chip identification & flashing
+    pyocd       pip install pyocd              CMSIS-DAP / DAPLink target chip ID
+    picotool    GitHub release zip             Pi Pico (RP2040 / RP2350) inspection
+    avrdude     GitHub release zip / brew /    Arduino (ATmega328P / 2560 / 32U4)
+                apt-get
+    zadig       libwdi GitHub release          Win-only: replace USB driver → WinUSB
+    cp210x      silabs.com universal driver    Win-only: CP2102/CP2104 VCP driver
+    ch340       wch-ic.com CH341SER.EXE        Win-only: CH340/CH341 USB-Serial driver
+
+EXAMPLES:
+    # Listing only — no chip reset, safe to run any time
+    usbipd-rs
+
+    # Full probe — gets chip type, revision, flash size, MAC, etc.
+    usbipd-rs --probe
+
+    # Install picotool from upstream Raspberry Pi release
+    usbipd-rs --install picotool
+
+    # Install pyocd via pip (needed for DAPLink target identification)
+    usbipd-rs --install pyocd
+
+    # Download Zadig + see manual driver-replacement steps for Pi Pico BOOTSEL
+    usbipd-rs --install zadig
+
+NOTES:
+    * --probe asserts DTR/RTS or SWD reset → resets target chip. Do NOT run
+      while a 3D-printer or other live firmware is talking on the same port.
+    * --install caches downloads under <project>/windows-driver/ (Windows) or
+      <project>/tools/ (macOS/Linux). Existing files are reused — delete to
+      force re-download.
+    * Pi Pico (BOOTSEL) on Windows additionally needs a WinUSB driver swap via
+      Zadig. Run `usbipd-rs --install zadig` and follow the printed steps.
+    * macOS / Linux ship CP210x and CH340 kernel modules; only Windows needs
+      those installers.
+
+DATA SOURCES:
+    USB enumeration   usbipd.exe list (Windows) + nusb (cross-platform USB lib)
+    COM-port mapping  serialport crate
+    Bundled binaries  windows-driver/picotool/, windows-driver/avrdude/, ...
+"#;
+    print!("{help}");
+}
+
+fn cmd_list_usb() -> Result<()> {
     let probe = std::env::args()
         .any(|a| matches!(a.as_str(), "--probe" | "--probe-esp" | "--probe-arduino" | "-p"));
 
@@ -126,15 +238,27 @@ fn main() -> Result<()> {
     } else {
         println!("Probable boards detected:");
         for (e, b) in &candidates {
-            let kind = match b.probe {
-                ProbeKind::Espflash => "ESP",
-                ProbeKind::Avrdude { .. } => "AVR",
-                ProbeKind::Picotool => "RP2",
-            };
-            println!("  - [{kind}] {} ({}) at BUSID {}", e.vidpid, b.name, e.busid);
+            let labels: Vec<&str> = b
+                .probes
+                .iter()
+                .map(|p| match p {
+                    ProbeKind::Espflash => "ESP",
+                    ProbeKind::Avrdude { .. } => "AVR",
+                    ProbeKind::Picotool => "RP2",
+                    ProbeKind::Daplink => "DAP",
+                    ProbeKind::Pyocd => "SWD",
+                })
+                .collect();
+            println!(
+                "  - [{}] {} ({}) at BUSID {}",
+                labels.join("+"),
+                e.vidpid,
+                b.name,
+                e.busid
+            );
         }
         println!();
-        println!("Run with --probe to query each board (espflash / avrdude / picotool).");
+        println!("Run with --probe to query each board (espflash / avrdude / picotool / DAPLink / pyocd).");
         println!("Note: probing may reset the chip — do NOT use while a 3D-printer or");
         println!("      other live firmware is communicating.");
     }
@@ -147,57 +271,64 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
 
     for (entry, board) in candidates {
         let (vid, pid) = entry.vidpid_pair();
-        let needs_port = board.probe.needs_serial_port();
 
-        let port_name = if needs_port {
-            serial_ports.iter().find_map(|p| match &p.port_type {
-                serialport::SerialPortType::UsbPort(info)
-                    if info.vid == vid && info.pid == pid =>
-                {
-                    Some(p.port_name.clone())
-                }
-                _ => None,
-            })
-        } else {
-            None
-        };
+        for &probe in board.probes {
+            let needs_port = probe.needs_serial_port();
 
-        if needs_port && port_name.is_none() {
-            println!(
-                "\n[{}  {}  {}]  no COM port found (attached to WSL? — `usbipd detach --busid {}` first)",
-                entry.busid, board.name, entry.vidpid, entry.busid
-            );
-            continue;
-        }
+            let port_name = if needs_port {
+                serial_ports.iter().find_map(|p| match &p.port_type {
+                    serialport::SerialPortType::UsbPort(info)
+                        if info.vid == vid && info.pid == pid =>
+                    {
+                        Some(p.port_name.clone())
+                    }
+                    _ => None,
+                })
+            } else {
+                None
+            };
 
-        let header_port = port_name.as_deref().unwrap_or("(via libusb)");
-        println!(
-            "\n[{}  {}  {}  via {}]",
-            entry.busid, board.name, header_port, board.probe.tool_name()
-        );
-
-        let result = match board.probe {
-            ProbeKind::Espflash => run_espflash_board_info(port_name.as_deref().unwrap()),
-            ProbeKind::Avrdude { mcu, programmer, baud } => {
-                run_avrdude_query(port_name.as_deref().unwrap(), mcu, programmer, baud)
+            if needs_port && port_name.is_none() {
+                println!(
+                    "\n[{}  {}  {}  via {}]  no COM port found",
+                    entry.busid, board.name, entry.vidpid, probe.tool_name()
+                );
+                continue;
             }
-            ProbeKind::Picotool => run_picotool_info(vid, pid),
-        };
 
-        match result {
-            Ok(info) if !info.is_empty() => match board.probe {
-                ProbeKind::Espflash => print_esp_info(&info),
-                ProbeKind::Avrdude { .. } => print_avr_info(&info, board.name),
-                ProbeKind::Picotool => print_pico_info(&info, board.name),
-            },
-            Ok(_) => println!("  (no info parsed from output)"),
-            Err(e) => {
-                let msg = e.to_string();
-                let mut lines = msg.lines();
-                if let Some(first) = lines.next() {
-                    println!("  Error: {first}");
-                    for line in lines {
-                        println!("         {line}");
+            let header_port = port_name.as_deref().unwrap_or("(via libusb)");
+            println!(
+                "\n[{}  {}  {}  via {}]",
+                entry.busid, board.name, header_port, probe.tool_name()
+            );
+
+            let result = match probe {
+                ProbeKind::Espflash => run_espflash_board_info(port_name.as_deref().unwrap()),
+                ProbeKind::Avrdude { mcu, programmer, baud } => {
+                    run_avrdude_query(port_name.as_deref().unwrap(), mcu, programmer, baud)
+                }
+                ProbeKind::Picotool => run_picotool_info(vid, pid),
+                ProbeKind::Daplink => run_daplink_query(),
+                ProbeKind::Pyocd => run_pyocd_query(vid, pid),
+            };
+
+            match result {
+                Ok(info) if !info.is_empty() => match probe {
+                    ProbeKind::Espflash => print_esp_info(&info),
+                    ProbeKind::Avrdude { .. } => print_avr_info(&info, board.name),
+                    ProbeKind::Picotool => print_pico_info(&info, board.name),
+                    ProbeKind::Daplink => print_daplink_info(&info, board.name),
+                    ProbeKind::Pyocd => print_pyocd_info(&info),
+                },
+                Ok(_) => println!("  (no info parsed from output)"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let mut lines = msg.lines();
+                    if let Some(first) = lines.next() {
+                        println!("  Error: {first}");
+                        for line in lines {
+                            println!("         {line}");
+                        }
                     }
                 }
             }
@@ -385,13 +516,19 @@ fn find_picotool() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             // Candidates relative to our binary.
-            // Dev layout: <project>/target/release/usbipd-rs.exe
-            //             ^^^^^^^^/windows-driver/picotool/picotool.exe
+            //
+            // Dev layout (manual placement):
+            //   <project>/windows-driver/picotool/picotool.exe
+            // Fresh `--install picotool` layout (zip has top-level picotool/):
+            //   <project>/windows-driver/picotool/picotool/picotool.exe
+            // Either way the binary sits at most 2 levels under `windows-driver/`.
             let candidates = [
                 dir.join("picotool.exe"),
                 dir.join("picotool").join("picotool.exe"),
                 dir.join("..").join("..").join("windows-driver").join("picotool").join("picotool.exe"),
+                dir.join("..").join("..").join("windows-driver").join("picotool").join("picotool").join("picotool.exe"),
                 dir.join("..").join("..").join("..").join("windows-driver").join("picotool").join("picotool.exe"),
+                dir.join("..").join("..").join("..").join("windows-driver").join("picotool").join("picotool").join("picotool.exe"),
             ];
             for c in candidates {
                 if c.exists() {
@@ -541,6 +678,202 @@ fn decode_flash_devinfo(v: &str) -> String {
         parts.push(format!("CS1 on GPIO {cs1_gpio}, code 0x{cs1_size:x}"));
     }
     parts.join("; ")
+}
+
+fn run_daplink_query() -> Result<HashMap<String, String>> {
+    let drive = find_daplink_drive().context(
+        "DAPLink mass storage drive not found. \
+         Check that the device shows up as a USB drive and DETAILS.TXT exists at its root.",
+    )?;
+    let path = drive.join("DETAILS.TXT");
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Could not read {}", path.display()))?;
+    let mut info = parse_daplink_details(&content);
+    info.insert("Drive letter".to_string(), drive.to_string_lossy().into_owned());
+    Ok(info)
+}
+
+fn find_daplink_drive() -> Option<PathBuf> {
+    for letter in 'A'..='Z' {
+        let drive = PathBuf::from(format!("{letter}:\\"));
+        let details = drive.join("DETAILS.TXT");
+        if details.is_file() {
+            return Some(drive);
+        }
+    }
+    None
+}
+
+fn parse_daplink_details(s: &str) -> HashMap<String, String> {
+    let mut info = HashMap::new();
+    for raw in s.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let key = k.trim();
+        let value = v.trim();
+        if !key.is_empty() && !value.is_empty() {
+            info.insert(key.to_string(), value.to_string());
+        }
+    }
+    info
+}
+
+fn print_daplink_info(info: &HashMap<String, String>, board_name: &str) {
+    println!("  {:<20} {}", "Board:", board_name);
+    let order = [
+        ("Drive letter",       "MSD mount"),
+        ("Unique ID",          "Unique ID"),
+        ("HIC ID",             "HIC ID"),
+        ("Daplink Mode",       "DAPLink mode"),
+        ("Interface Version",  "Interface FW"),
+        ("Bootloader Version", "Bootloader FW"),
+        ("Git SHA",            "DAPLink commit"),
+        ("Local Mods",         "Local mods"),
+        ("USB Interfaces",     "USB interfaces"),
+        ("Auto Reset",         "Auto reset"),
+        ("Automation allowed", "Automation"),
+        ("Overflow detection", "Overflow det."),
+        ("Remount count",      "Remount count"),
+        ("URL",                "Board URL"),
+    ];
+    for (key, label) in order {
+        if let Some(v) = info.get(key) {
+            println!("  {:<20} {}", format!("{label}:"), v);
+        }
+    }
+
+    // Identify the specific board variant from Unique ID prefix and surface
+    // the underlying target chip, since DAPLink itself is just the interface.
+    if let Some(uid) = info.get("Unique ID") {
+        if let Some((variant, target)) = microbit_identify(uid) {
+            println!("  {:<20} {}", "Variant:", variant);
+            println!("  {:<20} {}", "Target chip:", target);
+        }
+    }
+}
+
+fn run_pyocd_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    // Use `pyocd json --probes` for stable parseable output (vs. the table form
+    // of `pyocd list -p`). This does NOT connect to or reset the SWD target —
+    // chip identity comes from pyocd's internal board database keyed by USB
+    // unique ID prefix.
+    //
+    // Force UTF-8 IO in the child Python so pyocd's checkmark glyphs don't
+    // crash on Windows consoles that default to cp950/cp936/etc.
+    let output = Command::new("pyocd")
+        .args(["json", "--probes"])
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .output()
+        .context("pyocd not found on PATH (install with: pip install pyocd)")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        let last = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("unknown");
+        anyhow::bail!("{}", last);
+    }
+    Ok(parse_pyocd_output(&stdout, vid, pid))
+}
+
+fn parse_pyocd_output(s: &str, vid: u16, pid: u16) -> HashMap<String, String> {
+    // pyocd JSON shape:
+    //   { "boards": [ { "unique_id": "...", "info": "...",
+    //                   "board_vendor": "...", "board_name": "...",
+    //                   "target": "nrf52833", "vendor_name": "Arm",
+    //                   "product_name": "BBC micro:bit CMSIS-DAP" } ] }
+    //
+    // We want fields from the first board entry. JSON parsing is small enough
+    // here that adding serde_json isn't worth the compile-time cost — extract
+    // each "key": "value" pair by string search.
+    let mut info = HashMap::new();
+    info.insert("USB filter".to_string(), format!("{:04x}:{:04x}", vid, pid));
+
+    let keys = [
+        "unique_id",
+        "info",
+        "board_vendor",
+        "board_name",
+        "target",
+        "vendor_name",
+        "product_name",
+    ];
+    for key in keys {
+        if let Some(v) = extract_json_string(s, key) {
+            info.insert(key.to_string(), v);
+        }
+    }
+    info
+}
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let idx = json.find(&needle)?;
+    let rest = json[idx + needle.len()..].trim_start();
+    let after = rest.strip_prefix('"')?;
+    // Find unescaped closing quote. pyocd values don't contain backslashes,
+    // but be defensive anyway.
+    let mut end = 0;
+    let bytes = after.as_bytes();
+    while end < bytes.len() {
+        if bytes[end] == b'\\' {
+            end += 2;
+            continue;
+        }
+        if bytes[end] == b'"' {
+            return Some(after[..end].to_string());
+        }
+        end += 1;
+    }
+    None
+}
+
+fn print_pyocd_info(info: &HashMap<String, String>) {
+    let order = [
+        ("vendor_name",  "Probe vendor"),
+        ("product_name", "Probe product"),
+        ("unique_id",    "Probe unique ID"),
+        ("board_vendor", "Board vendor"),
+        ("board_name",   "Board name"),
+        ("target",       "Target chip"),
+        ("info",         "Combined"),
+        ("USB filter",   "USB VID:PID"),
+    ];
+    let mut printed_any = false;
+    for (key, label) in order {
+        if let Some(v) = info.get(key) {
+            println!("  {:<20} {}", format!("{label}:"), v);
+            printed_any = true;
+        }
+    }
+    if !printed_any {
+        println!("  (pyocd returned no probe info — is the device still in the same port?)");
+    }
+}
+
+fn microbit_identify(unique_id: &str) -> Option<(&'static str, &'static str)> {
+    // First 4 hex digits of the Unique ID identify the board hardware revision
+    // (this prefix is assigned by Microbit Foundation / DAPLink board database).
+    let prefix = unique_id.get(..4)?;
+    let nrf51 = "nRF51822 — Cortex-M0, 16 KB SRAM, 256 KB flash, 16 MHz, BLE 4.0";
+    let nrf52 = "nRF52833 — Cortex-M4F, 128 KB SRAM, 512 KB flash, 64 MHz, BLE 5.x";
+    Some(match prefix {
+        "9900" => ("BBC micro:bit V1.3",          nrf51),
+        "9901" => ("BBC micro:bit V1.5",          nrf51),
+        "9903" => ("BBC micro:bit V2.0",          nrf52),
+        "9904" => ("BBC micro:bit V2.21",         nrf52),
+        "9905" => ("BBC micro:bit V2.21 (later)", nrf52),
+        "9906" => ("BBC micro:bit V2.x",          nrf52),
+        _ => return None,
+    })
 }
 
 fn avr_chip_summary(mcu: &str) -> &'static str {
@@ -696,3 +1029,453 @@ fn take_token(s: &str) -> (&str, &str) {
         None => (s, ""),
     }
 }
+
+// ============================================================================
+// Tool installer (--install / --list-tools)
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Os {
+    Windows,
+    Macos,
+    Linux,
+}
+
+fn current_os() -> Os {
+    match std::env::consts::OS {
+        "windows" => Os::Windows,
+        "macos" => Os::Macos,
+        _ => Os::Linux,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InstallStep {
+    /// Run a package-manager-style command (e.g., `cargo install foo`).
+    Command {
+        program: &'static str,
+        args: &'static [&'static str],
+    },
+    /// Download a URL and act on the file.
+    Download {
+        url: &'static str,
+        /// Override filename when URL doesn't yield a sensible one (e.g.,
+        /// query-only URLs like `?id=65`).
+        filename: Option<&'static str>,
+        action: DownloadAction,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum DownloadAction {
+    /// Save and prompt user to run with given instructions (no execution).
+    PromptToRun { instructions: &'static str },
+    /// Extract a zip into `windows-driver/<tool_id>/`. Used for CLI bundles.
+    ExtractToBundle { binary_hint: &'static str },
+    /// Extract a zip, locate the inner binary, then prompt user to run it
+    /// (typically as administrator). Used for driver installers shipped as zip.
+    ExtractAndPrompt {
+        binary_hint: &'static str,
+        instructions: &'static str,
+    },
+}
+
+struct ToolSpec {
+    id: &'static str,
+    name: &'static str,
+    purpose: &'static str,
+    /// Resolve install step for the given OS, or None if unsupported there.
+    resolve: fn(Os) -> Option<InstallStep>,
+    /// Optional: command to test if already installed (returns Some if found).
+    check_command: Option<&'static str>,
+}
+
+const PICOTOOL_WIN_URL: &str   = "https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.2.0-3/picotool-2.2.0-a4-x64-win.zip";
+const PICOTOOL_MAC_URL: &str   = "https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.2.0-3/picotool-2.2.0-a4-mac.zip";
+const PICOTOOL_LINUX_URL: &str = "https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.2.0-3/picotool-2.2.0-a4-x86_64-lin.tar.gz";
+
+const PICOTOOL_LINUX_INSTRUCTIONS: &str = "Linux: the archive is .tar.gz (zip extraction skipped). Extract manually:\n\
+  tar xzf <downloaded_file> -C ~/.local/bin/picotool/\n\
+or install via your package manager (Ubuntu 24.04+: `sudo apt install picotool`).";
+
+const ZADIG_URL: &str = "https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe";
+
+const ZADIG_INSTRUCTIONS: &str = "1. Right-click the downloaded zadig-2.9.exe and pick 'Run as administrator'.\n\
+2. In Zadig: Options → check 'List All Devices'.\n\
+3. Pick the BOOTSEL/PICOBOOT/RP2 Boot device from the dropdown.\n\
+4. Set the right-side driver to 'WinUSB' and click 'Replace Driver'.\n\
+5. Re-run usbipd-rs --probe to verify pi pico probing works.";
+
+// ── Step-2 tools ──
+const AVRDUDE_WIN_URL: &str =
+    "https://github.com/avrdudes/avrdude/releases/download/v8.1/avrdude-v8.1-windows-x64.zip";
+
+const CP210X_WIN_URL: &str =
+    "https://www.silabs.com/documents/public/software/CP210x_Universal_Windows_Driver.zip";
+
+const CP210X_INSTRUCTIONS: &str =
+    "Silabs Universal Driver is .inf-based (no .exe installer). Two ways to install:\n\
+     \n\
+     A) Right-click the silabser.inf path printed above → 'Install'.\n\
+        (Confirm any 'Open File' / UAC prompt.)\n\
+     \n\
+     B) From an admin PowerShell, run:\n\
+          pnputil /add-driver \"<silabser.inf path>\" /install\n\
+     \n\
+     Replug your CP2102/CP2104 board after install — it should appear as a COM port.";
+
+const CH340_WIN_URL: &str = "https://www.wch-ic.com/download/file?id=65";
+
+const CH340_INSTRUCTIONS: &str =
+    "1. Right-click CH341SER.EXE (path printed above) → 'Run as administrator'.\n\
+     2. Click 'INSTALL' in the WCH installer dialog.\n\
+     3. Replug the CH340-based board to bind the new driver.";
+
+const TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        id: "espflash",
+        name: "espflash",
+        purpose: "ESP32/ESP8266 chip identification & flashing",
+        resolve: |_os| Some(InstallStep::Command {
+            program: "cargo",
+            args: &["install", "espflash"],
+        }),
+        check_command: Some("espflash"),
+    },
+    ToolSpec {
+        id: "pyocd",
+        name: "pyOCD",
+        purpose: "CMSIS-DAP / DAPLink target chip identification",
+        resolve: |_os| Some(InstallStep::Command {
+            program: "pip",
+            args: &["install", "pyocd"],
+        }),
+        check_command: Some("pyocd"),
+    },
+    ToolSpec {
+        id: "picotool",
+        name: "picotool",
+        purpose: "Raspberry Pi RP2040/RP2350 inspection & flashing",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Download {
+                url: PICOTOOL_WIN_URL,
+                filename: None,
+                action: DownloadAction::ExtractToBundle { binary_hint: "picotool.exe" },
+            }),
+            Os::Macos => Some(InstallStep::Download {
+                url: PICOTOOL_MAC_URL,
+                filename: None,
+                action: DownloadAction::ExtractToBundle { binary_hint: "picotool" },
+            }),
+            Os::Linux => Some(InstallStep::Download {
+                url: PICOTOOL_LINUX_URL,
+                filename: None,
+                action: DownloadAction::PromptToRun { instructions: PICOTOOL_LINUX_INSTRUCTIONS },
+            }),
+        },
+        check_command: None, // bundled — find_picotool() locates it
+    },
+    ToolSpec {
+        id: "zadig",
+        name: "Zadig",
+        purpose: "Windows-only: replace a USB device's driver with WinUSB so libusb-based tools (picotool, etc.) can talk to it.",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Download {
+                url: ZADIG_URL,
+                filename: None,
+                action: DownloadAction::PromptToRun { instructions: ZADIG_INSTRUCTIONS },
+            }),
+            _ => None,
+        },
+        check_command: None,
+    },
+
+    // ── Step-2 tools ───────────────────────────────────────────────────
+    ToolSpec {
+        id: "avrdude",
+        name: "avrdude",
+        purpose: "AVR (Arduino Uno/Mega/Leonardo/Micro) chip ID & flashing",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Download {
+                url: AVRDUDE_WIN_URL,
+                filename: None,
+                action: DownloadAction::ExtractToBundle { binary_hint: "avrdude.exe" },
+            }),
+            Os::Macos => Some(InstallStep::Command {
+                program: "brew",
+                args: &["install", "avrdude"],
+            }),
+            Os::Linux => Some(InstallStep::Command {
+                program: "sudo",
+                args: &["apt-get", "install", "-y", "avrdude"],
+            }),
+        },
+        check_command: Some("avrdude"),
+    },
+    ToolSpec {
+        id: "cp210x",
+        name: "Silabs CP210x VCP Driver",
+        purpose: "Windows-only: USB Serial driver for ESP32 dev boards using CP2102/CP2104.",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Download {
+                url: CP210X_WIN_URL,
+                filename: None,
+                action: DownloadAction::ExtractAndPrompt {
+                    binary_hint: "silabser.inf",
+                    instructions: CP210X_INSTRUCTIONS,
+                },
+            }),
+            Os::Macos => None,  // Mac CP210x driver is in-kernel since macOS 11+
+            Os::Linux => None,  // Linux ships cp210x kernel module by default
+        },
+        check_command: None,
+    },
+    ToolSpec {
+        id: "ch340",
+        name: "WCH CH340/CH341 Driver",
+        purpose: "Windows-only: USB Serial driver for cheap clone Arduinos & ESP boards using CH340G.",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Download {
+                url: CH340_WIN_URL,
+                filename: Some("CH341SER.EXE"),
+                action: DownloadAction::PromptToRun { instructions: CH340_INSTRUCTIONS },
+            }),
+            Os::Macos => None,  // WCH provides separate macOS package; out of scope
+            Os::Linux => None,  // ch341 kernel module ships with mainline Linux
+        },
+        check_command: None,
+    },
+];
+
+fn cmd_list_tools() -> Result<()> {
+    let os = current_os();
+    println!("Detected OS: {os:?}\n");
+    println!("{:<12}  {:<10}  {:<10}  {}", "ID", "STATUS", "PROVIDER", "PURPOSE");
+    println!("{}", "-".repeat(80));
+    for tool in TOOLS {
+        let status = match tool.check_command {
+            Some(cmd) => {
+                if which_cmd(cmd).is_some() {
+                    "installed"
+                } else {
+                    "missing"
+                }
+            }
+            None => "—",
+        };
+        let provider = match (tool.resolve)(os) {
+            Some(InstallStep::Command { program, .. }) => program,
+            Some(InstallStep::Download { .. }) => "download",
+            None => "(n/a on this OS)",
+        };
+        println!("{:<12}  {:<10}  {:<10}  {}", tool.id, status, provider, tool.purpose);
+    }
+    println!();
+    println!("Run `usbipd-rs --install <ID>` to install.");
+    Ok(())
+}
+
+fn which_cmd(cmd: &str) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) {
+        &[".exe", ".cmd", ".bat", ""]
+    } else {
+        &[""]
+    };
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for ext in exts {
+            let candidate = dir.join(format!("{cmd}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn cmd_install(tool_id: &str) -> Result<()> {
+    let tool = TOOLS
+        .iter()
+        .find(|t| t.id == tool_id)
+        .ok_or_else(|| anyhow::anyhow!("Unknown tool '{tool_id}'. Try `--list-tools`."))?;
+    let os = current_os();
+    let step = (tool.resolve)(os).ok_or_else(|| {
+        anyhow::anyhow!("{} has no install path on {:?}", tool.name, os)
+    })?;
+
+    println!("=== Installing {} ===", tool.name);
+    println!("Purpose: {}", tool.purpose);
+    println!("OS:      {os:?}\n");
+
+    match step {
+        InstallStep::Command { program, args } => {
+            run_command(program, args)?;
+        }
+        InstallStep::Download { url, filename, action } => {
+            let dest_dir = bundle_dir()?;
+            std::fs::create_dir_all(&dest_dir)
+                .with_context(|| format!("Could not create {}", dest_dir.display()))?;
+            let fname = filename.unwrap_or_else(|| {
+                url.rsplit('/').next().unwrap_or("download.bin")
+            });
+            let dest = dest_dir.join(fname);
+            download_file(url, &dest)?;
+            match action {
+                DownloadAction::ExtractToBundle { binary_hint } => {
+                    let extract_to = dest_dir.join(tool.id);
+                    std::fs::create_dir_all(&extract_to)?;
+                    extract_zip(&dest, &extract_to)?;
+                    println!("\n  Extracted to: {}", extract_to.display());
+                    match find_in_dir(&extract_to, binary_hint) {
+                        Some(p) => println!("  Binary:       {}", p.display()),
+                        None => println!(
+                            "  Binary '{binary_hint}' not found inside archive — inspect the directory manually."
+                        ),
+                    }
+                }
+                DownloadAction::ExtractAndPrompt { binary_hint, instructions } => {
+                    let extract_to = dest_dir.join(tool.id);
+                    std::fs::create_dir_all(&extract_to)?;
+                    extract_zip(&dest, &extract_to)?;
+                    println!("\n  Extracted to: {}", extract_to.display());
+                    match find_in_dir(&extract_to, binary_hint) {
+                        Some(p) => println!("  Installer:    {}", p.display()),
+                        None => println!(
+                            "  Installer '{binary_hint}' not found — inspect the directory manually."
+                        ),
+                    }
+                    println!("\n  Manual steps:");
+                    for line in instructions.lines() {
+                        println!("    {line}");
+                    }
+                }
+                DownloadAction::PromptToRun { instructions } => {
+                    println!("\n  Saved to: {}", dest.display());
+                    println!("\n  Manual steps:");
+                    for line in instructions.lines() {
+                        println!("    {line}");
+                    }
+                }
+            }
+        }
+    }
+    println!("\n  Done.");
+    Ok(())
+}
+
+fn bundle_dir() -> Result<PathBuf> {
+    // Prefer <project>/windows-driver/ for Win (matches existing layout),
+    // <project>/tools/ for Mac/Linux.
+    let exe = std::env::current_exe()?;
+    let project = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Could not derive project root from exe path"))?;
+    let dir = if current_os() == Os::Windows {
+        project.join("windows-driver")
+    } else {
+        project.join("tools")
+    };
+    Ok(dir)
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<()> {
+    if let Ok(meta) = std::fs::metadata(dest) {
+        if meta.len() > 0 {
+            println!("  Existing:    {} ({} bytes)", dest.display(), meta.len());
+            println!("  (delete the file to force re-download)");
+            return Ok(());
+        }
+    }
+    println!("  Downloading: {url}");
+    let response = ureq::get(url).call().context("HTTP request failed")?;
+    let total: Option<u64> = response
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok());
+    if let Some(t) = total {
+        println!("  Size:        {t} bytes");
+    }
+
+    // Stage to <dest>.partial, then atomic rename. This avoids the
+    // ERROR_SHARING_VIOLATION on Windows when AV/Defender (or our previous
+    // run) still holds a handle to the existing dest file.
+    let staging = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.partial"),
+        None => "partial".into(),
+    });
+    let _ = std::fs::remove_file(&staging);
+
+    let mut reader = response.into_reader();
+    let mut file = std::fs::File::create(&staging)
+        .with_context(|| format!("Could not create {}", staging.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut written: u64 = 0;
+    let mut last_pct = -1i32;
+    loop {
+        let n = reader.read(&mut buf).context("Read from server failed")?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).context("Disk write failed")?;
+        written += n as u64;
+        if let Some(t) = total {
+            let pct = (written * 100 / t.max(1)) as i32;
+            if pct != last_pct && pct % 10 == 0 {
+                print!("  {pct}%... ");
+                let _ = std::io::stdout().flush();
+                last_pct = pct;
+            }
+        }
+    }
+    drop(file);
+    println!();
+
+    // Replace the (possibly locked) destination with the staged file.
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest);
+    }
+    std::fs::rename(&staging, dest).with_context(|| {
+        format!("Could not move {} → {}", staging.display(), dest.display())
+    })?;
+
+    println!("  Saved to:    {} ({} bytes)", dest.display(), written);
+    Ok(())
+}
+
+fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
+    println!("  Extracting:  {}", zip_path.display());
+    let file = std::fs::File::open(zip_path)
+        .with_context(|| format!("Could not open {}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("Not a valid zip file")?;
+    archive.extract(dest).context("Zip extraction failed")?;
+    Ok(())
+}
+
+fn find_in_dir(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().map(|n| n == name).unwrap_or(false) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_in_dir(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<()> {
+    println!("  Running:     {} {}", program, args.join(" "));
+    let status = Command::new(program).args(args).status().with_context(|| {
+        format!("Could not invoke `{program}` (is it on PATH?)")
+    })?;
+    if !status.success() {
+        anyhow::bail!("{program} exited with {status}");
+    }
+    Ok(())
+}
+

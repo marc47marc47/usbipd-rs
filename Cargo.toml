@@ -8,7 +8,9 @@ description = "List connected USB hardware in usbipd-list format (with nusb enri
 anyhow = "1"
 nusb = "0.1"
 serialport = "4"
+ureq = "2"
 unicode-width = "0.2"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "usbipd-rs"
