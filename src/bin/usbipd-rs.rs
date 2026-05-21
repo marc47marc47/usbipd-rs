@@ -13,7 +13,10 @@ enum ProbeKind {
     Avrdude {
         mcu: &'static str,
         programmer: &'static str,
-        baud: u32,
+        /// Bootloader sync baud rates to try, in order. FT232R-class boards
+        /// don't reveal which one the bootloader uses, so callers can pass
+        /// several candidates.
+        bauds: &'static [u32],
     },
     Picotool,
     Daplink,
@@ -51,19 +54,29 @@ const DAP_PIPELINE: &[ProbeKind] = &[ProbeKind::Daplink, ProbeKind::Pyocd];
 const KNOWN_BOARDS: &[KnownBoard] = &[
     // ── Arduino official boards (probe via avrdude) ──────────────────────
     KnownBoard { vid: 0x2341, pid: 0x0001, name: "Arduino Uno R1",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", baud: 115200 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", bauds: &[115200] }] },
     KnownBoard { vid: 0x2341, pid: 0x0043, name: "Arduino Uno R3",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", baud: 115200 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", bauds: &[115200] }] },
     KnownBoard { vid: 0x2341, pid: 0x0010, name: "Arduino Mega 2560",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", bauds: &[115200] }] },
     KnownBoard { vid: 0x2341, pid: 0x0042, name: "Arduino Mega 2560 R3",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", bauds: &[115200] }] },
     KnownBoard { vid: 0x2341, pid: 0x0044, name: "Arduino Mega ADK",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", baud: 115200 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", bauds: &[115200] }] },
     KnownBoard { vid: 0x2341, pid: 0x8036, name: "Arduino Leonardo",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", baud: 57600 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", bauds: &[57600] }] },
     KnownBoard { vid: 0x2341, pid: 0x8037, name: "Arduino Micro",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", baud: 57600 }] },
+        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", bauds: &[57600] }] },
+
+    // ── Arduino-compatible boards behind a generic FTDI USB-UART bridge ──
+    // FT232R (0403:6001) is a bare USB-serial chip — it can't tell us what MCU
+    // sits on its TX/RX lines. Classic Arduinos that use it (Nano, Duemilanove)
+    // speak the STK500v1 bootloader protocol, so probe via avrdude. We request
+    // atmega328p (the common case); avrdude runs with -F, so a 328PB / 168 /
+    // LGT8F328P clone still connects and reports its true signature instead of
+    // erroring. Bootloader baud varies by board age → try 57600 then 115200.
+    KnownBoard { vid: 0x0403, pid: 0x6001, name: "FT232R Arduino (ATmega328-class)",
+        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", bauds: &[57600, 115200] }] },
 
     // ── ESP32 USB-UART bridges & native USB (probe via espflash) ─────────
     KnownBoard { vid: 0x10c4, pid: 0xea60, name: "CP2102/CP2102N", probes: ESP },
@@ -132,7 +145,7 @@ OPTIONS:
                                tool (espflash, avrdude, picotool, DAPLink, pyocd).
                                Aliases: --probe-esp, --probe-arduino.
         --list-tools           List installable tools, their OS provider (cargo / pip /
-                               brew / apt / download) and install status.
+                               brew / apt / download / manual) and install status.
         --install <ID>         Install one tool by ID. See --list-tools for IDs.
     -h, --help                 Show this help.
     -V, --version              Print version (from Cargo.toml) and exit.
@@ -141,6 +154,7 @@ WHAT GETS DETECTED (VID:PID → board → probe):
     10C4:EA60 / EA70 / EA71      Silabs CP210x bridge       → ESP32 (espflash)
     1A86:7523 / 55D4              WCH CH340 / CH9102         → ESP32 (espflash)
     0403:6010 / 6014 / 6015       FTDI FT2232 / FT232H / X   → ESP32 (espflash)
+    0403:6001                     FTDI FT232R (Arduino)      → AVR  (avrdude)
     303A:1001 / 4001              ESP32 native USB-Serial    → ESP32 (espflash)
     2341:0001 / 0043              Arduino Uno R1 / R3        → AVR  (avrdude)
     2341:0010 / 0042 / 0044       Arduino Mega 2560 / ADK    → AVR  (avrdude)
@@ -153,11 +167,13 @@ INSTALLABLE TOOLS (see --list-tools for live status):
     espflash    cargo install espflash         ESP chip identification & flashing
     pyocd       pip install pyocd              CMSIS-DAP / DAPLink target chip ID
     picotool    GitHub release zip             Pi Pico (RP2040 / RP2350) inspection
-    avrdude     GitHub release zip / brew /    Arduino (ATmega328P / 2560 / 32U4)
-                apt-get
+    avrdude     GitHub release zip / brew /    Arduino (ATmega328P / 328PB /
+                apt-get                        2560 / 32U4) chip ID & flashing
+    ravedude    cargo install ravedude         avr-hal `cargo run` runner (Rust AVR)
     zadig       libwdi GitHub release          Win-only: replace USB driver → WinUSB
     cp210x      silabs.com universal driver    Win-only: CP2102/CP2104 VCP driver
     ch340       wch-ic.com CH341SER.EXE        Win-only: CH340/CH341 USB-Serial driver
+    ftdi        ftdichip.com CDM (manual)      Win-only: FTDI FT232R VCP driver
 
 EXAMPLES:
     # Listing only — no chip reset, safe to run any time
@@ -310,8 +326,8 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
 
             let result = match probe {
                 ProbeKind::Espflash => run_espflash_board_info(port_name.as_deref().unwrap()),
-                ProbeKind::Avrdude { mcu, programmer, baud } => {
-                    run_avrdude_query(port_name.as_deref().unwrap(), mcu, programmer, baud)
+                ProbeKind::Avrdude { mcu, programmer, bauds } => {
+                    run_avrdude_query(port_name.as_deref().unwrap(), mcu, programmer, bauds)
                 }
                 ProbeKind::Picotool => run_picotool_info(vid, pid),
                 ProbeKind::Daplink => run_daplink_query(),
@@ -414,34 +430,67 @@ fn print_esp_info(info: &HashMap<String, String>) {
     }
 }
 
-fn run_avrdude_query(port: &str, mcu: &str, programmer: &str, baud: u32) -> Result<HashMap<String, String>> {
+fn run_avrdude_query(
+    port: &str,
+    mcu: &str,
+    programmer: &str,
+    bauds: &[u32],
+) -> Result<HashMap<String, String>> {
     // Serial bootloader programmers (arduino/wiring/avr109/stk500v1/stk500v2)
     // can read flash/eeprom/signature but NOT fuses — fuse reads return 0 silently.
     // Skip fuse reads here; only an ISP programmer on the ICSP header can read them.
-    let baud_str = baud.to_string();
-    let output = Command::new("avrdude")
-        .args([
-            "-c", programmer,
-            "-p", mcu,
-            "-P", port,
-            "-b", &baud_str,
-            "-v",
-        ])
-        .output()
-        .context("avrdude not found on PATH (install via Arduino IDE, PlatformIO, or scoop install avrdude)")?;
+    //
+    // A generic USB-UART bridge (FT232R, etc.) doesn't reveal which baud the
+    // Arduino bootloader runs at, so `bauds` may hold several candidates: try
+    // each in order and return the first that syncs.
+    //
+    // `-F` overrides avrdude's signature check: when the actual MCU differs
+    // from `-p` (a 328PB / 168 / LGT8F328P clone behind a generic bridge), the
+    // run still succeeds and reports the true `Device signature` instead of
+    // bailing. `-F` only relaxes the post-connect check — a board that never
+    // syncs (wrong baud, or no Arduino at all) still fails cleanly. Probing is
+    // read-only here (no -U), so overriding the check has no side effects.
+    let mut last_err = String::from("avrdude produced no output");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    for &baud in bauds {
+        let baud_str = baud.to_string();
+        let output = Command::new("avrdude")
+            .args([
+                "-c", programmer,
+                "-p", mcu,
+                "-P", port,
+                "-b", &baud_str,
+                "-F",
+                "-v",
+            ])
+            .output()
+            .context("avrdude not found on PATH (install via Arduino IDE, PlatformIO, or scoop install avrdude)")?;
 
-    if !output.status.success() {
-        let last = stderr
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("unknown");
-        anyhow::bail!("{}", last);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() {
+            return Ok(parse_avrdude_output(&stdout, &stderr, mcu));
+        }
+        last_err = summarize_avrdude_error(&stderr, baud);
     }
-    Ok(parse_avrdude_output(&stdout, &stderr, mcu))
+    anyhow::bail!("{last_err}");
+}
+
+fn summarize_avrdude_error(stderr: &str, baud: u32) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let last = lines.last().copied().unwrap_or("unknown");
+    // A signature mismatch (wrong -p) is the most actionable failure, but the
+    // "Device signature = ..." line isn't the last one avrdude prints — pull it
+    // out so the caller can tell a wrong MCU guess from a baud/wiring problem.
+    match lines.iter().rev().find(|l| l.contains("Device signature")) {
+        Some(sig) if *sig != last => format!("at {baud} baud — {sig}; {last}"),
+        _ => format!("at {baud} baud — {last}"),
+    }
 }
 
 fn parse_avrdude_output(_stdout: &str, stderr: &str, requested_mcu: &str) -> HashMap<String, String> {
@@ -1070,6 +1119,14 @@ enum InstallStep {
         filename: Option<&'static str>,
         action: DownloadAction,
     },
+    /// Print a download URL and manual steps without fetching anything.
+    /// For vendors whose web server blocks automated downloads (e.g. FTDI
+    /// returns HTTP 403 to any non-browser client), so an auto-download would
+    /// just fail for every user.
+    Manual {
+        url: &'static str,
+        instructions: &'static str,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1136,6 +1193,24 @@ const CH340_INSTRUCTIONS: &str =
     "1. Right-click CH341SER.EXE (path printed above) → 'Run as administrator'.\n\
      2. Click 'INSTALL' in the WCH installer dialog.\n\
      3. Replug the CH340-based board to bind the new driver.";
+
+const FTDI_CDM_URL: &str =
+    "https://ftdichip.com/wp-content/uploads/2021/08/CDM212364_Setup.zip";
+
+const FTDI_INSTRUCTIONS: &str =
+    "FTDI's web server returns HTTP 403 to non-browser clients, so this driver\n\
+     cannot be auto-downloaded — fetch it in a browser instead:\n\
+     \n\
+     1. Open the URL above in a browser and save CDM212364_Setup.zip.\n\
+     2. Extract it, then right-click CDM212364_Setup.exe → 'Run as administrator'.\n\
+     3. Replug the FT232R board — it should appear as a COM port.\n\
+     \n\
+     You usually DON'T need this: Windows 10/11 installs the FTDI VCP driver\n\
+     automatically via Windows Update. If your board already shows a COMx\n\
+     port, the driver is already working — this entry is just for offline or\n\
+     freshly-imaged machines.\n\
+     \n\
+     Chocolatey users can instead run:  choco install ftdi-drivers";
 
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
@@ -1219,6 +1294,16 @@ const TOOLS: &[ToolSpec] = &[
         check_command: Some("avrdude"),
     },
     ToolSpec {
+        id: "ravedude",
+        name: "ravedude",
+        purpose: "avr-hal `cargo run` runner — wraps avrdude to flash Rust AVR firmware & open a serial monitor.",
+        resolve: |_os| Some(InstallStep::Command {
+            program: "cargo",
+            args: &["install", "ravedude"],
+        }),
+        check_command: Some("ravedude"),
+    },
+    ToolSpec {
         id: "cp210x",
         name: "Silabs CP210x VCP Driver",
         purpose: "Windows-only: USB Serial driver for ESP32 dev boards using CP2102/CP2104.",
@@ -1251,6 +1336,20 @@ const TOOLS: &[ToolSpec] = &[
         },
         check_command: None,
     },
+    ToolSpec {
+        id: "ftdi",
+        name: "FTDI VCP Driver (CDM)",
+        purpose: "Windows-only: USB Serial (VCP) driver for FTDI FT232R/FT232RL — classic Arduinos & USB-UART adapters. Windows 10/11 usually installs it automatically.",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Manual {
+                url: FTDI_CDM_URL,
+                instructions: FTDI_INSTRUCTIONS,
+            }),
+            Os::Macos => None,  // macOS ships an FTDI VCP driver in-kernel
+            Os::Linux => None,  // Linux ftdi_sio kernel module ships by default
+        },
+        check_command: None,
+    },
 ];
 
 fn cmd_list_tools() -> Result<()> {
@@ -1272,6 +1371,7 @@ fn cmd_list_tools() -> Result<()> {
         let provider = match (tool.resolve)(os) {
             Some(InstallStep::Command { program, .. }) => program,
             Some(InstallStep::Download { .. }) => "download",
+            Some(InstallStep::Manual { .. }) => "manual",
             None => "(n/a on this OS)",
         };
         println!("{:<12}  {:<10}  {:<10}  {}", tool.id, status, provider, tool.purpose);
@@ -1362,6 +1462,13 @@ fn cmd_install(tool_id: &str) -> Result<()> {
                         println!("    {line}");
                     }
                 }
+            }
+        }
+        InstallStep::Manual { url, instructions } => {
+            println!("  Download URL: {url}");
+            println!("\n  Manual steps:");
+            for line in instructions.lines() {
+                println!("    {line}");
             }
         }
     }
