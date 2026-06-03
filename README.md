@@ -6,9 +6,10 @@ the right protocol-specific tool — `espflash`, `stm32flash`, `avrdude`,
 `picotool`, DAPLink `DETAILS.TXT`, or `pyocd`.
 
 > **Status:** built and used daily on Windows 11 with `usbipd-win`.
-> macOS / Linux builds compile and ship from CI, but the listing layer
-> currently shells out to `usbipd.exe`, so on non-Windows hosts only the
-> `--install` and probe sub-commands are useful today.
+> macOS / Linux are supported too: there the listing layer enumerates USB
+> natively via `nusb` (no `usbipd.exe` needed), and the `--probe` / `--install`
+> sub-commands work as on Windows. The usbip share/attach STATE column is
+> Windows-only.
 
 ---
 
@@ -63,6 +64,7 @@ metadata and USB serial-number → board database lookup.)
 | `0403:6010` / `6014` / `6015` | FTDI FT2232 / FT232H / FT231X    | `espflash` → `stm32flash` → `avrdude` |
 | `0403:6001`               | FTDI FT232R (Arduino Nano/Duemilanove) | `nusb` descriptors → `avrdude` |
 | `303A:1001` / `4001`      | ESP32 native USB-Serial-JTAG / OTG   | `espflash`                  |
+| `0483:DF11`               | STM32 USB DFU bootloader (DfuSe)     | `dfu-util` (memory map)     |
 | `2341:0001` / `0043`      | Arduino Uno R1 / R3                  | `avrdude`                   |
 | `2341:0010` / `0042` / `0044` | Arduino Mega 2560 / Mega ADK     | `avrdude`                   |
 | `2341:8036` / `8037`      | Arduino Leonardo / Micro             | `avrdude`                   |
@@ -96,12 +98,15 @@ sudo apt-get install libudev-dev pkg-config
 
 ### Windows: usbipd-win prerequisite
 
-The list command shells out to `usbipd.exe list`. Install
+On Windows the list command shells out to `usbipd.exe list`. Install
 [usbipd-win](https://github.com/dorssel/usbipd-win) first:
 
 ```powershell
 winget install --interactive --exact dorssel.usbipd-win
 ```
+
+On macOS / Linux this isn't needed — listing enumerates USB directly via
+`nusb`.
 
 ## Usage
 
@@ -124,7 +129,9 @@ usbipd-rs --help               # full reference
 | `picotool`   | GitHub release zip                    | Pi Pico (RP2040 / RP2350) inspection             |
 | `avrdude`    | GitHub release zip / brew / apt       | AVR (Arduino) chip ID & flashing                 |
 | `stm32flash` | bundled zip in `windows-driver/`      | STM32 / GD32 UART-bootloader chip ID & flashing (Win / Linux / macOS binaries) |
+| `dfu-util`   | `brew` / `apt` / manual (Windows)     | STM32 USB DFU (`0483:DF11`) memory-map / chip-family ID & flashing |
 | `ravedude`   | `cargo install ravedude`              | avr-hal `cargo run` runner (Rust AVR dev)        |
+| `arduino-cli`| download (Win / Linux) / `brew` (macOS) | Arduino core manager — bundles avrdude (`core install arduino:avr`), esptool, etc. |
 | `zadig`      | libwdi GitHub release                 | Win-only: replace USB driver → WinUSB            |
 | `cp210x`     | silabs.com universal driver           | Win-only: CP2102/CP2104 VCP driver               |
 | `ch340`      | wch-ic.com `CH341SER.EXE`             | Win-only: CH340/CH341 USB-Serial driver          |
@@ -176,7 +183,8 @@ fan out into multiple probe back-ends. The micro:bit entry uses
 
 ## Dependencies
 
-- [`nusb`](https://crates.io/crates/nusb) — pure-Rust USB enumeration
+- [`nusb`](https://crates.io/crates/nusb) — pure-Rust USB enumeration (the
+  native listing source on macOS / Linux)
 - [`serialport`](https://crates.io/crates/serialport) — COM port mapping
 - [`ureq`](https://crates.io/crates/ureq) — HTTP client for installer downloads
 - [`zip`](https://crates.io/crates/zip) — archive extraction
@@ -186,7 +194,7 @@ fan out into multiple probe back-ends. The micro:bit entry uses
 ## Acknowledgements
 
 - [`usbipd-win`](https://github.com/dorssel/usbipd-win) — supplies the
-  Windows USB enumeration via `usbipd.exe list`.
+  Windows USB enumeration via `usbipd.exe list` (macOS / Linux use `nusb`).
 - [`espflash`](https://github.com/esp-rs/espflash),
   [`avrdude`](https://github.com/avrdudes/avrdude),
   [`picotool`](https://github.com/raspberrypi/picotool),

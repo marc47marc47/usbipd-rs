@@ -31,6 +31,11 @@ enum ProbeKind {
     /// Requires the chip to be in bootloader mode (BOOT0=HIGH at reset);
     /// fails fast (~3s) when no chip responds, so safe to chain.
     Stm32Flash,
+    /// STM32 USB DFU (DfuSe) bootloader probe via `dfu-util -l`. The ROM
+    /// bootloader presents as native USB (VID:PID 0483:DF11), not a COM port,
+    /// so this is read-only descriptor listing — alt settings + per-region
+    /// memory layout (flash base/size, option bytes) — with no chip reset.
+    Dfu,
     /// Read FTDI device descriptors via nusb (manufacturer / product /
     /// serial / bcdDevice chip variant / Windows driver binding). Read-only,
     /// no COM port, no chip reset — safe to chain before any serial probe.
@@ -53,6 +58,7 @@ impl ProbeKind {
             ProbeKind::Espflash => "espflash",
             ProbeKind::Avrdude { .. } => "avrdude",
             ProbeKind::Stm32Flash => "stm32flash",
+            ProbeKind::Dfu => "dfu-util",
             ProbeKind::Ftdi => "nusb",
             ProbeKind::Picotool => "picotool",
             ProbeKind::Daplink => "DETAILS.TXT",
@@ -76,6 +82,7 @@ const AVR_32U4: AvrTarget = AvrTarget { mcu: "atmega32u4", programmer: "avr109",
 // Reusable probe pipelines
 const ESP: &[ProbeKind] = &[ProbeKind::Espflash];
 const PICO: &[ProbeKind] = &[ProbeKind::Picotool];
+const DFU: &[ProbeKind] = &[ProbeKind::Dfu];
 const DAP_PIPELINE: &[ProbeKind] = &[ProbeKind::Daplink, ProbeKind::Pyocd];
 
 // A generic USB-UART bridge (CH340, CP210x, FT2232/FT232H/FT231X) carries no
@@ -157,6 +164,15 @@ const KNOWN_BOARDS: &[KnownBoard] = &[
     KnownBoard { vid: 0x303a, pid: 0x1001, name: "ESP32 USB-Serial-JTAG", probes: ESP },
     KnownBoard { vid: 0x303a, pid: 0x4001, name: "ESP32 USB-OTG",  probes: ESP },
 
+    // ── STM32 system ROM USB DFU bootloader (DfuSe) (probe via dfu-util) ──
+    // VID:PID 0483:DF11 is the on-chip DFU bootloader every STM32 with USB
+    // exposes (entered via BOOT0=HIGH at reset, or a firmware "jump to
+    // bootloader"). It's native USB, not a UART/COM port, so stm32flash can't
+    // reach it — dfu-util reads the alt-setting memory map (flash base/size,
+    // option bytes) read-only. On Windows the DFU interface needs a WinUSB
+    // driver (run `usbipd-rs --install zadig`).
+    KnownBoard { vid: 0x0483, pid: 0xdf11, name: "STM32 DFU Bootloader (DfuSe)", probes: DFU },
+
     // ── Raspberry Pi Pico (RP2040 / RP2350) (probe via picotool) ─────────
     KnownBoard { vid: 0x2e8a, pid: 0x0003, name: "RP2040 BOOTSEL (Pi Pico)",   probes: PICO },
     KnownBoard { vid: 0x2e8a, pid: 0x000f, name: "RP2350 BOOTSEL (Pi Pico 2)", probes: PICO },
@@ -225,6 +241,7 @@ WHAT GETS DETECTED (VID:PID → board → probe):
     0403:6010 / 6014 / 6015       FTDI FT2232 / FT232H / X   → ESP / STM32 / AVR (espflash → stm32flash → avrdude)
     0403:6001                     FTDI FT232R (Arduino)      → FTDI+AVR (nusb descriptors → avrdude)
     303A:1001 / 4001              ESP32 native USB-Serial    → ESP32 (espflash)
+    0483:DF11                     STM32 USB DFU bootloader   → STM32 (dfu-util, DfuSe memory map)
     2341:0001 / 0043              Arduino Uno R1 / R3        → AVR  (avrdude)
     2341:0010 / 0042 / 0044       Arduino Mega 2560 / ADK    → AVR  (avrdude)
     2341:8036 / 8037              Arduino Leonardo / Micro   → AVR  (avrdude)
@@ -240,7 +257,10 @@ INSTALLABLE TOOLS (see --list-tools for live status):
                 apt-get                        2560 / 32U4) chip ID & flashing
     stm32flash  bundled zip (windows-driver/)  STM32 / GD32 UART-bootloader chip ID
                                                (e.g. GD32F103RET6 behind a CH340)
+    dfu-util    brew / apt / manual (Win)      STM32 USB DFU (0483:DF11) memory-map ID
     ravedude    cargo install ravedude         avr-hal `cargo run` runner (Rust AVR)
+    arduino-cli download (Win/Linux) /         Arduino core manager — bundles avrdude
+                brew (macOS)                   via `core install arduino:avr`, etc.
     zadig       libwdi GitHub release          Win-only: replace USB driver → WinUSB
     cp210x      silabs.com universal driver    Win-only: CP2102/CP2104 VCP driver
     ch340       wch-ic.com CH341SER.EXE        Win-only: CH340/CH341 USB-Serial driver
@@ -279,7 +299,8 @@ NOTES:
       those installers.
 
 DATA SOURCES:
-    USB enumeration   usbipd.exe list (Windows) + nusb (cross-platform USB lib)
+    USB enumeration   nusb (cross-platform USB lib) on macOS/Linux;
+                      usbipd.exe list (Windows, for share/attach STATE)
     COM-port mapping  serialport crate
     Bundled binaries  windows-driver/picotool/, windows-driver/avrdude/, ...
 "#;
@@ -290,7 +311,7 @@ fn cmd_list_usb() -> Result<()> {
     let probe = std::env::args()
         .any(|a| matches!(a.as_str(), "--probe" | "--probe-esp" | "--probe-arduino" | "-p"));
 
-    let entries = run_usbipd_list()?;
+    let entries = list_entries()?;
     let nusb_devs = nusb_by_vidpid();
 
     let rows: Vec<[String; 5]> = entries
@@ -314,7 +335,7 @@ fn cmd_list_usb() -> Result<()> {
     print_table(&rows);
 
     if rows.is_empty() {
-        println!("(no connected USB devices reported by usbipd)");
+        println!("(no connected USB devices found)");
         return Ok(());
     }
 
@@ -343,6 +364,7 @@ fn cmd_list_usb() -> Result<()> {
                     ProbeKind::Espflash => "ESP",
                     ProbeKind::Avrdude { .. } => "AVR",
                     ProbeKind::Stm32Flash => "STM32",
+                    ProbeKind::Dfu => "DFU",
                     ProbeKind::Ftdi => "FTDI",
                     ProbeKind::Picotool => "RP2",
                     ProbeKind::Daplink => "DAP",
@@ -410,7 +432,7 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
             // header; other libusb-based probes keep the generic placeholder.
             let header_port: &str = if let Some(p) = port_name.as_deref() {
                 p
-            } else if matches!(probe, ProbeKind::Ftdi) {
+            } else if matches!(probe, ProbeKind::Ftdi | ProbeKind::Dfu) {
                 entry.vidpid.as_str()
             } else {
                 "(via libusb)"
@@ -426,6 +448,7 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                     run_avrdude_query(port_name.as_deref().unwrap(), targets)
                 }
                 ProbeKind::Stm32Flash => run_stm32flash_query(port_name.as_deref().unwrap()),
+                ProbeKind::Dfu => run_dfu_info(vid, pid),
                 ProbeKind::Ftdi => run_ftdi_info(vid, pid),
                 ProbeKind::Picotool => run_picotool_info(vid, pid),
                 ProbeKind::Daplink => run_daplink_query(),
@@ -441,6 +464,7 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                         ProbeKind::Espflash => print_esp_info(&info),
                         ProbeKind::Avrdude { .. } => print_avr_info(&info, board.name),
                         ProbeKind::Stm32Flash => print_stm32_info(&info, board.name),
+                        ProbeKind::Dfu => print_dfu_info(&info, board.name),
                         ProbeKind::Ftdi => print_ftdi_info(&info, board.name),
                         ProbeKind::Picotool => print_pico_info(&info, board.name),
                         ProbeKind::Daplink => print_daplink_info(&info, board.name),
@@ -915,6 +939,166 @@ fn print_stm32_info(info: &HashMap<String, String>, board_name: &str) {
     }
 }
 
+fn run_dfu_info(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    // `dfu-util -l` lists every DFU device's alt settings + DfuSe memory map
+    // on stdout (the version banner goes to stderr). Read-only; no chip reset.
+    let output = Command::new("dfu-util")
+        .arg("-l")
+        .output()
+        .context("dfu-util not found on PATH (install with: usbipd-rs --install dfu-util)")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let info = parse_dfu_output(&stdout, vid, pid);
+    if info.is_empty() {
+        // dfu-util ran but didn't list our device — usually a missing libusb
+        // binding (Windows needs WinUSB on the DFU interface) or the chip left
+        // bootloader mode between listing and probe.
+        let hint = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .find(|l| l.contains("Cannot open") || l.contains("libusb") || l.contains("permission"))
+            .unwrap_or(
+                "dfu-util did not list this device — it may have left DFU mode, \
+                 or (on Windows) the DFU interface needs a WinUSB driver \
+                 (run `usbipd-rs --install zadig`).",
+            );
+        anyhow::bail!("{hint}");
+    }
+    Ok(info)
+}
+
+fn parse_dfu_output(s: &str, vid: u16, pid: u16) -> HashMap<String, String> {
+    // Each matching line looks like:
+    //   Found DFU: [0483:df11] ver=2200, devnum=5, cfg=1, intf=0, path="20-1.4",
+    //              alt=0, name="@Internal Flash  /0x08000000/04*016Kg,01*064Kg,07*128Kg",
+    //              serial="3576345C3137"
+    // One line per alt setting; we aggregate them into a single report.
+    let target = format!("[{:04x}:{:04x}]", vid, pid);
+    let mut info = HashMap::new();
+    let mut alt_count = 0u32;
+    let mut regions: Vec<String> = Vec::new();
+
+    for line in s.lines() {
+        let line = line.trim();
+        if !line.starts_with("Found DFU:") || !line.contains(&target) {
+            continue;
+        }
+        alt_count += 1;
+
+        if let Some(v) = dfu_field(line, "ver") {
+            info.entry("bcdDevice".to_string()).or_insert(format!("0x{v}"));
+        }
+        if let Some(v) = dfu_field(line, "serial") {
+            info.entry("Serial number".to_string()).or_insert(v);
+        }
+        if let Some(name) = dfu_field(line, "name") {
+            if let Some((label, detail, flash_kb)) = format_dfu_region(&name) {
+                regions.push(format!("{label}: {detail}"));
+                if let Some(kb) = flash_kb {
+                    info.insert("Flash size".to_string(), format!("{kb} KB"));
+                }
+            }
+        }
+    }
+
+    if alt_count == 0 {
+        return info;
+    }
+    info.insert("VID:PID".to_string(), format!("{:04x}:{:04x}", vid, pid));
+    info.insert("Alt settings".to_string(), alt_count.to_string());
+    if !regions.is_empty() {
+        info.insert("Memory map".to_string(), regions.join("\n"));
+    }
+    info
+}
+
+/// Pull the value of `key=` from a dfu-util listing line. Quoted values
+/// (`name="..."`, `serial="..."`) run to the closing quote; bare values
+/// (`ver=2200`) run to the next comma.
+fn dfu_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let idx = line.find(&needle)?;
+    let rest = &line[idx + needle.len()..];
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        Some(stripped[..end].to_string())
+    } else {
+        let end = rest.find(',').unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    }
+}
+
+/// Turn a DfuSe alt-setting name into (label, detail, flash_kb).
+/// Input: `@Internal Flash  /0x08000000/04*016Kg,01*064Kg,07*128Kg`
+/// flash_kb is Some only for the internal-flash region.
+fn format_dfu_region(name: &str) -> Option<(String, String, Option<u64>)> {
+    let mut parts = name.splitn(3, '/');
+    let label = parts.next()?.trim().trim_start_matches('@').trim().to_string();
+    let addr = parts.next()?.trim();
+    let layout = parts.next().unwrap_or("").trim();
+
+    if label.eq_ignore_ascii_case("Internal Flash") {
+        if let Some(kb) = dfu_region_size_kb(layout) {
+            return Some((label, format!("{kb} KB @ {addr} ({layout})"), Some(kb)));
+        }
+    }
+    let detail = if layout.is_empty() {
+        format!("@ {addr}")
+    } else {
+        format!("@ {addr} ({layout})")
+    };
+    Some((label, detail, None))
+}
+
+/// Sum a DfuSe sector layout like `04*016Kg,01*064Kg,07*128Kg` into total KB.
+/// Each segment is `<count>*<pagesize><unit><flags>` (unit K = KiB, M = MiB).
+fn dfu_region_size_kb(layout: &str) -> Option<u64> {
+    let mut total_bytes: u64 = 0;
+    for seg in layout.split(',') {
+        let seg = seg.trim();
+        let (count_s, rest) = seg.split_once('*')?;
+        let count: u64 = count_s.trim().parse().ok()?;
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let page: u64 = digits.parse().ok()?;
+        let unit = rest[digits.len()..].chars().next().unwrap_or(' ');
+        let mult = match unit {
+            'K' => 1024,
+            'M' => 1024 * 1024,
+            _ => 1,
+        };
+        total_bytes += count * page * mult;
+    }
+    Some(total_bytes / 1024)
+}
+
+fn print_dfu_info(info: &HashMap<String, String>, board_name: &str) {
+    println!("  {:<20} {}", "Board:", board_name);
+    let order = [
+        ("Flash size",    "Flash size"),
+        ("bcdDevice",     "bcdDevice"),
+        ("Serial number", "Serial number"),
+        ("Alt settings",  "Alt settings"),
+        ("VID:PID",       "VID:PID"),
+    ];
+    for (key, label) in order {
+        if let Some(v) = info.get(key) {
+            println!("  {:<20} {}", format!("{label}:"), v);
+        }
+    }
+    if let Some(mm) = info.get("Memory map") {
+        println!("  {:<20}", "Memory map:");
+        for region in mm.lines() {
+            println!("    - {region}");
+        }
+    }
+    println!(
+        "  {:<20} (DFU mode reports a generic 0483:DF11; the flash geometry above\n  {:<20}  identifies the STM32 family — exact part can't be read over DFU)",
+        "Note:", ""
+    );
+}
+
 fn find_picotool() -> PathBuf {
     if let Ok(p) = std::env::var("PICOTOOL_PATH") {
         let pb = PathBuf::from(p);
@@ -1103,11 +1287,47 @@ fn run_daplink_query() -> Result<HashMap<String, String>> {
 }
 
 fn find_daplink_drive() -> Option<PathBuf> {
-    for letter in 'A'..='Z' {
-        let drive = PathBuf::from(format!("{letter}:\\"));
-        let details = drive.join("DETAILS.TXT");
-        if details.is_file() {
+    // Windows: DAPLink mounts as a lettered drive (D:\, E:\, ...).
+    if current_os() == Os::Windows {
+        for letter in 'A'..='Z' {
+            let drive = PathBuf::from(format!("{letter}:\\"));
+            if drive.join("DETAILS.TXT").is_file() {
+                return Some(drive);
+            }
+        }
+        return None;
+    }
+
+    // macOS / Linux: removable media mounts as a subdirectory under a few
+    // well-known roots. `/Volumes/*` (macOS), `/media/*` and `/mnt/*` (Linux),
+    // plus the per-user `/run/media/<user>/<label>` layout (one level deeper).
+    let direct_roots = ["/Volumes", "/media", "/mnt"];
+    let nested_roots = ["/run/media", "/media"];
+
+    for root in direct_roots {
+        if let Some(drive) = scan_mount_children(Path::new(root)) {
             return Some(drive);
+        }
+    }
+    for root in nested_roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for user_dir in entries.flatten() {
+                if let Some(drive) = scan_mount_children(&user_dir.path()) {
+                    return Some(drive);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return the first immediate child of `root` that holds a `DETAILS.TXT` file.
+fn scan_mount_children(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.join("DETAILS.TXT").is_file() {
+            return Some(path);
         }
     }
     None
@@ -1368,6 +1588,44 @@ fn nusb_by_vidpid() -> HashMap<(u16, u16), nusb::DeviceInfo> {
         .unwrap_or_default()
 }
 
+/// Pick a USB enumeration source for the host OS. Windows has the usbip
+/// share/attach model, so we parse `usbipd.exe list` to surface its STATE
+/// column; everywhere else there's no such daemon, so enumerate directly via
+/// the cross-platform `nusb` crate.
+fn list_entries() -> Result<Vec<Entry>> {
+    if current_os() == Os::Windows {
+        run_usbipd_list()
+    } else {
+        Ok(nusb_entries())
+    }
+}
+
+/// Build the listing rows straight from `nusb` (macOS / Linux). There's no
+/// usbip BUSID or share state off Windows, so synthesize a stable `bus-address`
+/// id and leave STATE blank. Sorted by (bus, address) for deterministic output.
+fn nusb_entries() -> Vec<Entry> {
+    let mut devs: Vec<nusb::DeviceInfo> = nusb::list_devices()
+        .map(|it| it.collect())
+        .unwrap_or_default();
+    devs.sort_by_key(|d| (d.bus_number(), d.device_address()));
+    devs.iter()
+        .map(|d| {
+            let device = match (d.manufacturer_string(), d.product_string()) {
+                (Some(m), Some(p)) => format!("{m} {p}"),
+                (None, Some(p)) => p.to_string(),
+                (Some(m), None) => m.to_string(),
+                (None, None) => "(unknown device)".to_string(),
+            };
+            Entry {
+                busid: format!("{}-{}", d.bus_number(), d.device_address()),
+                vidpid: format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
+                device,
+                state: String::new(),
+            }
+        })
+        .collect()
+}
+
 fn run_usbipd_list() -> Result<Vec<Entry>> {
     let output = Command::new("usbipd.exe")
         .arg("list")
@@ -1581,6 +1839,36 @@ const FTDI_INSTRUCTIONS: &str =
 // stm32flash.exe + stm32flash_linux + stm32flash_macos) and just extract it.
 const STM32FLASH_BUNDLE: &str = "stm32flash-0.7-binaries.zip";
 
+// arduino-cli ships per-OS archives; the `_latest_` URLs are stable (302 →
+// current release). Windows is a .zip we can auto-extract; macOS uses Homebrew
+// (matches avrdude); Linux is a .tar.gz the bundled zip crate can't open, so we
+// download and print manual-extract steps (same pattern as picotool on Linux).
+const ARDUINO_CLI_WIN_URL: &str =
+    "https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Windows_64bit.zip";
+const ARDUINO_CLI_LINUX_URL: &str =
+    "https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz";
+const ARDUINO_CLI_LINUX_INSTRUCTIONS: &str = "Linux: the archive is .tar.gz (zip extraction skipped). Extract manually:\n\
+  tar xzf <downloaded_file> -C ~/.local/bin/\n\
+or install via the official script:\n\
+  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh";
+
+// dfu-util upstream ships only a SourceForge .tar.xz behind browser redirects,
+// so Windows is a Manual step; macOS/Linux have it in brew / apt.
+const DFU_UTIL_WIN_URL: &str = "https://dfu-util.sourceforge.net/releases/";
+
+const DFU_UTIL_WIN_INSTRUCTIONS: &str =
+    "Windows has no auto-installer for dfu-util (SourceForge serves a .tar.xz\n\
+     behind browser redirects). Install manually:\n\
+     \n\
+     1. Open the URL above and download the latest dfu-util-<ver>-binaries.tar.xz.\n\
+     2. Extract it (7-Zip handles .tar.xz); add the win64\\ folder to PATH, or\n\
+        copy dfu-util.exe next to usbipd-rs.exe.\n\
+     3. The STM32 DFU interface needs a WinUSB driver — run\n\
+          usbipd-rs --install zadig\n\
+        and replace the '0483:DF11 / STM32 BOOTLOADER' device driver with WinUSB.\n\
+     \n\
+     Chocolatey users can instead run:  choco install dfu-util";
+
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         id: "espflash",
@@ -1683,6 +1971,26 @@ const TOOLS: &[ToolSpec] = &[
         check_command: None,
     },
     ToolSpec {
+        id: "dfu-util",
+        name: "dfu-util",
+        purpose: "STM32 USB DFU (DfuSe) bootloader (0483:DF11) memory-map / chip-family ID & flashing.",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Manual {
+                url: DFU_UTIL_WIN_URL,
+                instructions: DFU_UTIL_WIN_INSTRUCTIONS,
+            }),
+            Os::Macos => Some(InstallStep::Command {
+                program: "brew",
+                args: &["install", "dfu-util"],
+            }),
+            Os::Linux => Some(InstallStep::Command {
+                program: "sudo",
+                args: &["apt-get", "install", "-y", "dfu-util"],
+            }),
+        },
+        check_command: Some("dfu-util"),
+    },
+    ToolSpec {
         id: "ravedude",
         name: "ravedude",
         purpose: "avr-hal `cargo run` runner — wraps avrdude to flash Rust AVR firmware & open a serial monitor.",
@@ -1691,6 +1999,28 @@ const TOOLS: &[ToolSpec] = &[
             args: &["install", "ravedude"],
         }),
         check_command: Some("ravedude"),
+    },
+    ToolSpec {
+        id: "arduino-cli",
+        name: "Arduino CLI",
+        purpose: "Arduino board/core manager. `arduino-cli core install arduino:avr` then bundles avrdude (and esp32 core → esptool, etc.).",
+        resolve: |os| match os {
+            Os::Windows => Some(InstallStep::Download {
+                url: ARDUINO_CLI_WIN_URL,
+                filename: None,
+                action: DownloadAction::ExtractToBundle { binary_hint: "arduino-cli.exe" },
+            }),
+            Os::Macos => Some(InstallStep::Command {
+                program: "brew",
+                args: &["install", "arduino-cli"],
+            }),
+            Os::Linux => Some(InstallStep::Download {
+                url: ARDUINO_CLI_LINUX_URL,
+                filename: None,
+                action: DownloadAction::PromptToRun { instructions: ARDUINO_CLI_LINUX_INSTRUCTIONS },
+            }),
+        },
+        check_command: Some("arduino-cli"),
     },
     ToolSpec {
         id: "cp210x",

@@ -61,8 +61,11 @@ two largely independent subsystems.
   bundled paths and the `PICOTOOL_PATH` env var.
 - **Probing resets the target chip** (toggles DTR/RTS or asserts SWD reset).
   Never probe a port with live firmware on it.
-- Windows-centric: the listing layer shells out to `usbipd.exe`. On
-  macOS/Linux only `--install` and the probe sub-commands are meaningful.
+- Listing source is OS-dispatched in `list_entries()`: Windows parses
+  `usbipd.exe list` (for the share/attach STATE column); macOS/Linux enumerate
+  natively via `nusb` in `nusb_entries()` (BUSID synthesized as
+  `bus-address`, STATE blank). All sub-commands (`--probe`, `--install`) work
+  on every OS.
 - avrdude probes run with `-F` (override the signature check, so a mismatched
   MCU still reports its true signature) and a list of candidate baud rates
   tried in order.
