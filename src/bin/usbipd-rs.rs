@@ -7,17 +7,34 @@ use unicode_width::UnicodeWidthStr;
 
 const HEADERS: [&str; 5] = ["BUSID", "VID:PID", "DEVICE", "STATE", "SPEED"];
 
+/// One avrdude connection attempt: an MCU paired with the bootloader
+/// programmer that drives it, plus the sync baud rates to try (in order).
+/// FT232R-class boards don't reveal which baud the bootloader uses, so
+/// `bauds` may hold several candidates.
+#[derive(Clone, Copy)]
+struct AvrTarget {
+    mcu: &'static str,
+    programmer: &'static str,
+    bauds: &'static [u32],
+}
+
 #[derive(Clone, Copy)]
 enum ProbeKind {
     Espflash,
-    Avrdude {
-        mcu: &'static str,
-        programmer: &'static str,
-        /// Bootloader sync baud rates to try, in order. FT232R-class boards
-        /// don't reveal which one the bootloader uses, so callers can pass
-        /// several candidates.
-        bauds: &'static [u32],
-    },
+    /// Try each `AvrTarget` in order; the first that syncs wins. A board on a
+    /// dedicated Arduino VID:PID passes exactly one target; a board behind a
+    /// generic USB-UART bridge passes several, since the bridge can't reveal
+    /// whether a Uno-class (STK500v1) or Mega-class (STK500v2) MCU is wired
+    /// to it.
+    Avrdude { targets: &'static [AvrTarget] },
+    /// STM32 / GD32 system-memory UART bootloader probe (`stm32flash`).
+    /// Requires the chip to be in bootloader mode (BOOT0=HIGH at reset);
+    /// fails fast (~3s) when no chip responds, so safe to chain.
+    Stm32Flash,
+    /// Read FTDI device descriptors via nusb (manufacturer / product /
+    /// serial / bcdDevice chip variant / Windows driver binding). Read-only,
+    /// no COM port, no chip reset — safe to chain before any serial probe.
+    Ftdi,
     Picotool,
     Daplink,
     Pyocd,
@@ -25,13 +42,18 @@ enum ProbeKind {
 
 impl ProbeKind {
     fn needs_serial_port(&self) -> bool {
-        matches!(self, ProbeKind::Espflash | ProbeKind::Avrdude { .. })
+        matches!(
+            self,
+            ProbeKind::Espflash | ProbeKind::Avrdude { .. } | ProbeKind::Stm32Flash
+        )
     }
 
     fn tool_name(&self) -> &'static str {
         match self {
             ProbeKind::Espflash => "espflash",
             ProbeKind::Avrdude { .. } => "avrdude",
+            ProbeKind::Stm32Flash => "stm32flash",
+            ProbeKind::Ftdi => "nusb",
             ProbeKind::Picotool => "picotool",
             ProbeKind::Daplink => "DETAILS.TXT",
             ProbeKind::Pyocd => "pyocd",
@@ -46,47 +68,92 @@ struct KnownBoard {
     probes: &'static [ProbeKind],
 }
 
+// ── avrdude connection profiles, keyed by Arduino bootloader family ─────
+const AVR_UNO:  AvrTarget = AvrTarget { mcu: "atmega328p", programmer: "arduino", bauds: &[115200] };
+const AVR_MEGA: AvrTarget = AvrTarget { mcu: "atmega2560", programmer: "wiring",  bauds: &[115200] };
+const AVR_32U4: AvrTarget = AvrTarget { mcu: "atmega32u4", programmer: "avr109",  bauds: &[57600] };
+
 // Reusable probe pipelines
 const ESP: &[ProbeKind] = &[ProbeKind::Espflash];
 const PICO: &[ProbeKind] = &[ProbeKind::Picotool];
 const DAP_PIPELINE: &[ProbeKind] = &[ProbeKind::Daplink, ProbeKind::Pyocd];
 
+// A generic USB-UART bridge (CH340, CP210x, FT2232/FT232H/FT231X) carries no
+// information about which MCU is wired to its TX/RX lines — the same chip
+// ships on ESP, STM32/GD32, and Arduino (Uno/Nano/Mega) clones alike. Probe
+// in fail-fast order:
+//   1. espflash — fast on real ESP via DTR/RTS auto-bootloader (~2s).
+//   2. stm32flash — needs user to manually pull BOOT0=HIGH + RESET, but fails
+//      in ~3s when no STM32/GD32 responds. Catches GD32F103 / STM32 dev
+//      boards that don't auto-reset (most generic boards don't wire DTR/RTS
+//      to BOOT0/RESET).
+//   3. avrdude — slowest (multiple programmer+baud combos, ~10s when failing),
+//      but the only way to detect Arduino-class boards. Tries both bootloader
+//      dialects: STK500v1 ("arduino", Uno/Nano-class) and STK500v2 ("wiring",
+//      Mega 2560).
+// probe_boards() stops at the first serial probe that syncs, so a real ESP
+// never reaches stm32flash; a real GD32 in bootloader never reaches avrdude.
+const BRIDGE: &[ProbeKind] = &[
+    ProbeKind::Espflash,
+    ProbeKind::Stm32Flash,
+    ProbeKind::Avrdude {
+        targets: &[
+            // Uno/Nano-class: bootloader baud varies by clone age → try the
+            // modern 115200 first, then the legacy 57600.
+            AvrTarget { mcu: "atmega328p", programmer: "arduino", bauds: &[115200, 57600] },
+            AVR_MEGA,
+        ],
+    },
+];
+
 const KNOWN_BOARDS: &[KnownBoard] = &[
     // ── Arduino official boards (probe via avrdude) ──────────────────────
     KnownBoard { vid: 0x2341, pid: 0x0001, name: "Arduino Uno R1",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", bauds: &[115200] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_UNO] }] },
     KnownBoard { vid: 0x2341, pid: 0x0043, name: "Arduino Uno R3",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", bauds: &[115200] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_UNO] }] },
     KnownBoard { vid: 0x2341, pid: 0x0010, name: "Arduino Mega 2560",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", bauds: &[115200] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_MEGA] }] },
     KnownBoard { vid: 0x2341, pid: 0x0042, name: "Arduino Mega 2560 R3",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", bauds: &[115200] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_MEGA] }] },
     KnownBoard { vid: 0x2341, pid: 0x0044, name: "Arduino Mega ADK",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega2560", programmer: "wiring", bauds: &[115200] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_MEGA] }] },
     KnownBoard { vid: 0x2341, pid: 0x8036, name: "Arduino Leonardo",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", bauds: &[57600] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_32U4] }] },
     KnownBoard { vid: 0x2341, pid: 0x8037, name: "Arduino Micro",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega32u4", programmer: "avr109", bauds: &[57600] }] },
+        probes: &[ProbeKind::Avrdude { targets: &[AVR_32U4] }] },
 
-    // ── Arduino-compatible boards behind a generic FTDI USB-UART bridge ──
+    // ── Classic Arduino behind a bare FTDI FT232R USB-UART bridge ────────
     // FT232R (0403:6001) is a bare USB-serial chip — it can't tell us what MCU
     // sits on its TX/RX lines. Classic Arduinos that use it (Nano, Duemilanove)
     // speak the STK500v1 bootloader protocol, so probe via avrdude. We request
     // atmega328p (the common case); avrdude runs with -F, so a 328PB / 168 /
     // LGT8F328P clone still connects and reports its true signature instead of
     // erroring. Bootloader baud varies by board age → try 57600 then 115200.
+    //
+    // Always run the read-only Ftdi descriptor probe first so the user gets
+    // useful info (chip variant, serial, driver binding) even when no Arduino
+    // MCU is wired downstream and avrdude fails to sync.
     KnownBoard { vid: 0x0403, pid: 0x6001, name: "FT232R Arduino (ATmega328-class)",
-        probes: &[ProbeKind::Avrdude { mcu: "atmega328p", programmer: "arduino", bauds: &[57600, 115200] }] },
+        probes: &[
+            ProbeKind::Ftdi,
+            ProbeKind::Avrdude {
+                targets: &[AvrTarget { mcu: "atmega328p", programmer: "arduino", bauds: &[57600, 115200] }],
+            },
+        ] },
 
-    // ── ESP32 USB-UART bridges & native USB (probe via espflash) ─────────
-    KnownBoard { vid: 0x10c4, pid: 0xea60, name: "CP2102/CP2102N", probes: ESP },
-    KnownBoard { vid: 0x10c4, pid: 0xea70, name: "CP2105",         probes: ESP },
-    KnownBoard { vid: 0x10c4, pid: 0xea71, name: "CP2108",         probes: ESP },
-    KnownBoard { vid: 0x1a86, pid: 0x7523, name: "CH340",          probes: ESP },
-    KnownBoard { vid: 0x1a86, pid: 0x55d4, name: "CH9102",         probes: ESP },
-    KnownBoard { vid: 0x0403, pid: 0x6010, name: "FT2232",         probes: ESP },
-    KnownBoard { vid: 0x0403, pid: 0x6014, name: "FT232H",         probes: ESP },
-    KnownBoard { vid: 0x0403, pid: 0x6015, name: "FT231X",         probes: ESP },
+    // ── Generic USB-UART bridges: an ESP *or* an Arduino may sit behind ──
+    // them, so probe espflash first and fall back to avrdude (see BRIDGE).
+    KnownBoard { vid: 0x10c4, pid: 0xea60, name: "CP2102/CP2102N", probes: BRIDGE },
+    KnownBoard { vid: 0x10c4, pid: 0xea70, name: "CP2105",         probes: BRIDGE },
+    KnownBoard { vid: 0x10c4, pid: 0xea71, name: "CP2108",         probes: BRIDGE },
+    KnownBoard { vid: 0x1a86, pid: 0x7523, name: "CH340",          probes: BRIDGE },
+    KnownBoard { vid: 0x1a86, pid: 0x55d4, name: "CH9102",         probes: BRIDGE },
+    KnownBoard { vid: 0x0403, pid: 0x6010, name: "FT2232",         probes: BRIDGE },
+    KnownBoard { vid: 0x0403, pid: 0x6014, name: "FT232H",         probes: BRIDGE },
+    KnownBoard { vid: 0x0403, pid: 0x6015, name: "FT231X",         probes: BRIDGE },
+
+    // ── ESP32 native USB (the ESP silicon itself presents USB) ───────────
     KnownBoard { vid: 0x303a, pid: 0x1001, name: "ESP32 USB-Serial-JTAG", probes: ESP },
     KnownBoard { vid: 0x303a, pid: 0x4001, name: "ESP32 USB-OTG",  probes: ESP },
 
@@ -135,6 +202,8 @@ fn print_help() {
 USAGE:
     usbipd-rs                       List connected USB devices and detect probable boards.
     usbipd-rs --probe               List, then probe each detected board (chip-level info).
+                                    Bridge boards (CH340/CP210x/FT232) probe in fail-fast
+                                    order: espflash → stm32flash → avrdude.
     usbipd-rs --list-tools          Show install status of all probe-tool dependencies.
     usbipd-rs --install <ID>        Download/install one tool by its ID.
     usbipd-rs --help                Show this help.
@@ -142,8 +211,8 @@ USAGE:
 
 OPTIONS:
     -p, --probe                Probe each detected board with the matching chip-level
-                               tool (espflash, avrdude, picotool, DAPLink, pyocd).
-                               Aliases: --probe-esp, --probe-arduino.
+                               tool (espflash, stm32flash, avrdude, picotool, DAPLink,
+                               pyocd). Aliases: --probe-esp, --probe-arduino.
         --list-tools           List installable tools, their OS provider (cargo / pip /
                                brew / apt / download / manual) and install status.
         --install <ID>         Install one tool by ID. See --list-tools for IDs.
@@ -151,10 +220,10 @@ OPTIONS:
     -V, --version              Print version (from Cargo.toml) and exit.
 
 WHAT GETS DETECTED (VID:PID → board → probe):
-    10C4:EA60 / EA70 / EA71      Silabs CP210x bridge       → ESP32 (espflash)
-    1A86:7523 / 55D4              WCH CH340 / CH9102         → ESP32 (espflash)
-    0403:6010 / 6014 / 6015       FTDI FT2232 / FT232H / X   → ESP32 (espflash)
-    0403:6001                     FTDI FT232R (Arduino)      → AVR  (avrdude)
+    10C4:EA60 / EA70 / EA71      Silabs CP210x bridge       → ESP / STM32 / AVR (espflash → stm32flash → avrdude)
+    1A86:7523 / 55D4              WCH CH340 / CH9102         → ESP / STM32 / AVR (espflash → stm32flash → avrdude)
+    0403:6010 / 6014 / 6015       FTDI FT2232 / FT232H / X   → ESP / STM32 / AVR (espflash → stm32flash → avrdude)
+    0403:6001                     FTDI FT232R (Arduino)      → FTDI+AVR (nusb descriptors → avrdude)
     303A:1001 / 4001              ESP32 native USB-Serial    → ESP32 (espflash)
     2341:0001 / 0043              Arduino Uno R1 / R3        → AVR  (avrdude)
     2341:0010 / 0042 / 0044       Arduino Mega 2560 / ADK    → AVR  (avrdude)
@@ -169,6 +238,8 @@ INSTALLABLE TOOLS (see --list-tools for live status):
     picotool    GitHub release zip             Pi Pico (RP2040 / RP2350) inspection
     avrdude     GitHub release zip / brew /    Arduino (ATmega328P / 328PB /
                 apt-get                        2560 / 32U4) chip ID & flashing
+    stm32flash  bundled zip (windows-driver/)  STM32 / GD32 UART-bootloader chip ID
+                                               (e.g. GD32F103RET6 behind a CH340)
     ravedude    cargo install ravedude         avr-hal `cargo run` runner (Rust AVR)
     zadig       libwdi GitHub release          Win-only: replace USB driver → WinUSB
     cp210x      silabs.com universal driver    Win-only: CP2102/CP2104 VCP driver
@@ -194,6 +265,11 @@ EXAMPLES:
 NOTES:
     * --probe asserts DTR/RTS or SWD reset → resets target chip. Do NOT run
       while a 3D-printer or other live firmware is talking on the same port.
+    * stm32flash probing requires the chip in system bootloader mode
+      (BOOT0=HIGH at reset). CH340/CP210x boards typically don't wire DTR/RTS
+      to BOOT0, so the probe can't trigger bootloader entry automatically — if
+      you want stm32flash to identify a GD32/STM32, pull BOOT0 HIGH and press
+      RESET before running --probe.
     * --install caches downloads under <project>/windows-driver/ (Windows) or
       <project>/tools/ (macOS/Linux). Existing files are reused — delete to
       force re-download.
@@ -266,6 +342,8 @@ fn cmd_list_usb() -> Result<()> {
                 .map(|p| match p {
                     ProbeKind::Espflash => "ESP",
                     ProbeKind::Avrdude { .. } => "AVR",
+                    ProbeKind::Stm32Flash => "STM32",
+                    ProbeKind::Ftdi => "FTDI",
                     ProbeKind::Picotool => "RP2",
                     ProbeKind::Daplink => "DAP",
                     ProbeKind::Pyocd => "SWD",
@@ -280,7 +358,7 @@ fn cmd_list_usb() -> Result<()> {
             );
         }
         println!();
-        println!("Run with --probe to query each board (espflash / avrdude / picotool / DAPLink / pyocd).");
+        println!("Run with --probe to query each board (espflash / stm32flash / avrdude / picotool / DAPLink / pyocd).");
         println!("Note: probing may reset the chip — do NOT use while a 3D-printer or");
         println!("      other live firmware is communicating.");
     }
@@ -293,9 +371,18 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
 
     for (entry, board) in candidates {
         let (vid, pid) = entry.vidpid_pair();
+        // A single COM port carries exactly one chip: once any serial probe
+        // (espflash / stm32flash / avrdude) has identified it, the remaining
+        // serial probes in this board's pipeline can only fail — skip them
+        // silently.
+        let mut serial_chip_found = false;
 
         for &probe in board.probes {
             let needs_port = probe.needs_serial_port();
+
+            if needs_port && serial_chip_found {
+                continue;
+            }
 
             let port_name = if needs_port {
                 serial_ports.iter().find_map(|p| match &p.port_type {
@@ -318,7 +405,16 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 continue;
             }
 
-            let header_port = port_name.as_deref().unwrap_or("(via libusb)");
+            // For non-serial probes the FTDI descriptor probe identifies the
+            // device by VID:PID rather than a COM port, so surface that in the
+            // header; other libusb-based probes keep the generic placeholder.
+            let header_port: &str = if let Some(p) = port_name.as_deref() {
+                p
+            } else if matches!(probe, ProbeKind::Ftdi) {
+                entry.vidpid.as_str()
+            } else {
+                "(via libusb)"
+            };
             println!(
                 "\n[{}  {}  {}  via {}]",
                 entry.busid, board.name, header_port, probe.tool_name()
@@ -326,22 +422,31 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
 
             let result = match probe {
                 ProbeKind::Espflash => run_espflash_board_info(port_name.as_deref().unwrap()),
-                ProbeKind::Avrdude { mcu, programmer, bauds } => {
-                    run_avrdude_query(port_name.as_deref().unwrap(), mcu, programmer, bauds)
+                ProbeKind::Avrdude { targets } => {
+                    run_avrdude_query(port_name.as_deref().unwrap(), targets)
                 }
+                ProbeKind::Stm32Flash => run_stm32flash_query(port_name.as_deref().unwrap()),
+                ProbeKind::Ftdi => run_ftdi_info(vid, pid),
                 ProbeKind::Picotool => run_picotool_info(vid, pid),
                 ProbeKind::Daplink => run_daplink_query(),
                 ProbeKind::Pyocd => run_pyocd_query(vid, pid),
             };
 
             match result {
-                Ok(info) if !info.is_empty() => match probe {
-                    ProbeKind::Espflash => print_esp_info(&info),
-                    ProbeKind::Avrdude { .. } => print_avr_info(&info, board.name),
-                    ProbeKind::Picotool => print_pico_info(&info, board.name),
-                    ProbeKind::Daplink => print_daplink_info(&info, board.name),
-                    ProbeKind::Pyocd => print_pyocd_info(&info),
-                },
+                Ok(info) if !info.is_empty() => {
+                    if needs_port {
+                        serial_chip_found = true;
+                    }
+                    match probe {
+                        ProbeKind::Espflash => print_esp_info(&info),
+                        ProbeKind::Avrdude { .. } => print_avr_info(&info, board.name),
+                        ProbeKind::Stm32Flash => print_stm32_info(&info, board.name),
+                        ProbeKind::Ftdi => print_ftdi_info(&info, board.name),
+                        ProbeKind::Picotool => print_pico_info(&info, board.name),
+                        ProbeKind::Daplink => print_daplink_info(&info, board.name),
+                        ProbeKind::Pyocd => print_pyocd_info(&info),
+                    }
+                }
                 Ok(_) => println!("  (no info parsed from output)"),
                 Err(e) => {
                     let msg = e.to_string();
@@ -430,66 +535,70 @@ fn print_esp_info(info: &HashMap<String, String>) {
     }
 }
 
-fn run_avrdude_query(
-    port: &str,
-    mcu: &str,
-    programmer: &str,
-    bauds: &[u32],
-) -> Result<HashMap<String, String>> {
+fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<HashMap<String, String>> {
     // Serial bootloader programmers (arduino/wiring/avr109/stk500v1/stk500v2)
-    // can read flash/eeprom/signature but NOT fuses — fuse reads return 0 silently.
-    // Skip fuse reads here; only an ISP programmer on the ICSP header can read them.
+    // can read flash/eeprom/signature but NOT fuses — fuse reads return 0
+    // silently. Skip fuse reads here; only an ISP programmer on the ICSP
+    // header can read them.
     //
-    // A generic USB-UART bridge (FT232R, etc.) doesn't reveal which baud the
-    // Arduino bootloader runs at, so `bauds` may hold several candidates: try
-    // each in order and return the first that syncs.
+    // `targets` holds one or more (MCU, programmer, bauds) profiles to try in
+    // order — the first that syncs wins. A board on a dedicated Arduino VID
+    // passes exactly one; a board behind a generic USB-UART bridge passes
+    // several, because the bridge can't reveal whether a Uno-class (STK500v1
+    // "arduino") or a Mega-class (STK500v2 "wiring") MCU is on its lines.
     //
     // `-F` overrides avrdude's signature check: when the actual MCU differs
-    // from `-p` (a 328PB / 168 / LGT8F328P clone behind a generic bridge), the
-    // run still succeeds and reports the true `Device signature` instead of
-    // bailing. `-F` only relaxes the post-connect check — a board that never
-    // syncs (wrong baud, or no Arduino at all) still fails cleanly. Probing is
+    // from `-p` (a 328PB / 168 / LGT8F328P clone), the run still succeeds and
+    // reports the true `Device signature` instead of bailing. `-F` only
+    // relaxes the post-connect check — a board that never syncs (wrong baud,
+    // wrong bootloader dialect, or no Arduino at all) still fails cleanly, so
+    // chaining mismatched profiles produces no false positives. Probing is
     // read-only here (no -U), so overriding the check has no side effects.
     let mut last_err = String::from("avrdude produced no output");
 
-    for &baud in bauds {
-        let baud_str = baud.to_string();
-        let output = Command::new("avrdude")
-            .args([
-                "-c", programmer,
-                "-p", mcu,
-                "-P", port,
-                "-b", &baud_str,
-                "-F",
-                "-v",
-            ])
-            .output()
-            .context("avrdude not found on PATH (install via Arduino IDE, PlatformIO, or scoop install avrdude)")?;
+    for target in targets {
+        for &baud in target.bauds {
+            let baud_str = baud.to_string();
+            let output = Command::new("avrdude")
+                .args([
+                    "-c", target.programmer,
+                    "-p", target.mcu,
+                    "-P", port,
+                    "-b", &baud_str,
+                    "-F",
+                    "-v",
+                ])
+                .output()
+                .context("avrdude not found on PATH (install via Arduino IDE, PlatformIO, or scoop install avrdude)")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
 
-        if output.status.success() {
-            return Ok(parse_avrdude_output(&stdout, &stderr, mcu));
+            if output.status.success() {
+                return Ok(parse_avrdude_output(&stdout, &stderr, target.mcu));
+            }
+            last_err = summarize_avrdude_error(&stderr, target, baud);
         }
-        last_err = summarize_avrdude_error(&stderr, baud);
     }
     anyhow::bail!("{last_err}");
 }
 
-fn summarize_avrdude_error(stderr: &str, baud: u32) -> String {
+fn summarize_avrdude_error(stderr: &str, target: &AvrTarget, baud: u32) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
     let last = lines.last().copied().unwrap_or("unknown");
-    // A signature mismatch (wrong -p) is the most actionable failure, but the
-    // "Device signature = ..." line isn't the last one avrdude prints — pull it
-    // out so the caller can tell a wrong MCU guess from a baud/wiring problem.
+    // Name the attempt (programmer + baud) so a multi-target probe makes clear
+    // which bootloader dialect failed. A signature mismatch (wrong -p) is the
+    // most actionable failure, but the "Device signature = ..." line isn't the
+    // last one avrdude prints — pull it out so the caller can tell a wrong MCU
+    // guess from a baud/wiring problem.
+    let attempt = format!("{} @ {baud} baud", target.programmer);
     match lines.iter().rev().find(|l| l.contains("Device signature")) {
-        Some(sig) if *sig != last => format!("at {baud} baud — {sig}; {last}"),
-        _ => format!("at {baud} baud — {last}"),
+        Some(sig) if *sig != last => format!("{attempt} — {sig}; {last}"),
+        _ => format!("{attempt} — {last}"),
     }
 }
 
@@ -559,6 +668,251 @@ fn print_avr_info(info: &HashMap<String, String>, board_name: &str) {
         }
     }
     println!("  {:<20} (fuses require an ISP programmer on the ICSP header)", "Fuses:");
+}
+
+fn find_stm32flash() -> PathBuf {
+    if let Ok(p) = std::env::var("STM32FLASH_PATH") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    // Bundled v0.7 zip carries per-OS binaries with distinct names — pick the
+    // matching one. (The zip extracts as windows-driver/stm32flash/stm32flash-
+    // 0.7-binaries/<binary>.)
+    let binary_name = match std::env::consts::OS {
+        "windows" => "stm32flash.exe",
+        "linux"   => "stm32flash_linux",
+        "macos"   => "stm32flash_macos",
+        _         => "stm32flash",
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Candidate paths relative to the binary:
+            //   target/release/usbipd-rs.exe → ../../windows-driver/stm32flash/...
+            //   target/debug/usbipd-rs.exe   → same shape
+            //   plus a flat ./stm32flash{.exe,_linux,_macos} for portable layouts
+            let inner = Path::new("windows-driver")
+                .join("stm32flash")
+                .join("stm32flash-0.7-binaries")
+                .join(binary_name);
+            let candidates = [
+                dir.join(binary_name),
+                dir.join("..").join("..").join(&inner),
+                dir.join("..").join("..").join("..").join(&inner),
+            ];
+            for c in candidates {
+                if c.exists() {
+                    return c;
+                }
+            }
+        }
+    }
+    // Fallback: bare name, resolved via PATH (covers users who ran
+    // `scoop install stm32flash` / `brew install stm32flash` / `apt-get install
+    // stm32flash` instead of the bundled extract).
+    PathBuf::from("stm32flash")
+}
+
+fn run_stm32flash_query(port: &str) -> Result<HashMap<String, String>> {
+    let stm32flash = find_stm32flash();
+    let output = Command::new(&stm32flash)
+        .arg(port)
+        .output()
+        .with_context(|| format!(
+            "stm32flash not found (tried {} and PATH). Install with: usbipd-rs --install stm32flash",
+            stm32flash.display()
+        ))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        // stm32flash prints "Failed to init device, attempt N." when the chip
+        // doesn't respond at 0x7F — that's the normal "no STM32 here" case,
+        // not an install/usage error. Surface a one-line summary plus a hint
+        // about BOOT0 (CH340 boards don't auto-trigger bootloader mode).
+        let combined: Vec<&str> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .filter(|l| !l.starts_with("stm32flash "))
+            .filter(|l| !l.starts_with("http"))
+            .filter(|l| !l.starts_with("Using Parser"))
+            .filter(|l| !l.starts_with("Interface"))
+            .collect();
+        let summary = combined.last().copied().unwrap_or("no response");
+        anyhow::bail!(
+            "{summary}\n\
+             Hint: stm32flash needs the chip in system bootloader mode.\n\
+             Pull BOOT0 HIGH and press RESET, then re-run --probe.\n\
+             (Generic CH340 boards don't wire DTR/RTS to BOOT0/RESET, so this\n\
+              cannot be triggered automatically.)"
+        );
+    }
+    Ok(parse_stm32flash_output(&stdout))
+}
+
+fn parse_stm32flash_output(s: &str) -> HashMap<String, String> {
+    // Typical successful output (one field per line, ':' separator):
+    //   Version      : 0x22
+    //   Option 1     : 0x00
+    //   Option 2     : 0x00
+    //   Device ID    : 0x0414 (STM32F10xxx High-density)
+    //   - RAM        : Up to 64KiB  (12288b reserved by bootloader)
+    //   - Flash      : Up to 512KiB (size first sector: 4x2048)
+    //   - Option RAM : 16b
+    //   - System RAM : 2KiB
+    let mut info = HashMap::new();
+    let interesting = [
+        "Version",
+        "Option 1",
+        "Option 2",
+        "Device ID",
+        "RAM",
+        "Flash",
+        "Option RAM",
+        "System RAM",
+    ];
+    for raw in s.lines() {
+        // Strip leading '- ' (used for RAM/Flash/Option RAM/System RAM rows).
+        let line = raw.trim().trim_start_matches('-').trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            if interesting.contains(&key) {
+                info.insert(key.to_string(), v.trim().to_string());
+            }
+        }
+    }
+    info
+}
+
+fn run_ftdi_info(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    // Pull cached descriptor info from nusb's enumeration — no device IO,
+    // no chip reset, safe to chain before any serial probe. Windows caches
+    // product/serial strings via setupapi, but not the manufacturer string
+    // (that field will be None on Win regardless of descriptor contents).
+    let dev = nusb::list_devices()
+        .context("nusb::list_devices() failed")?
+        .find(|d| d.vendor_id() == vid && d.product_id() == pid)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "nusb could not find {:04x}:{:04x} (device replugged between listing and probe?)",
+                vid, pid
+            )
+        })?;
+
+    let mut info = HashMap::new();
+    info.insert("VID:PID".into(), format!("{:04x}:{:04x}", vid, pid));
+    if let Some(m) = dev.manufacturer_string() {
+        info.insert("Manufacturer".into(), m.into());
+    }
+    if let Some(p) = dev.product_string() {
+        info.insert("Product".into(), p.into());
+    }
+    if let Some(s) = dev.serial_number() {
+        info.insert("Serial number".into(), s.into());
+    }
+
+    let bcd_dev = dev.device_version();
+    let variant = ftdi_chip_variant(pid, bcd_dev);
+    let bcd_str = format!("0x{bcd_dev:04x}");
+    info.insert(
+        "Chip variant".into(),
+        if variant.is_empty() {
+            format!("bcdDevice {bcd_str}")
+        } else {
+            format!("{variant} (bcdDevice {bcd_str})")
+        },
+    );
+
+    // Windows: only populated for composite devices bound to usbccgp. An
+    // FT232R bound straight to ftdibus reports zero interfaces here — skip
+    // the field rather than print a misleading "0".
+    let ifaces: Vec<String> = dev
+        .interfaces()
+        .map(|i| {
+            let cls = i.class();
+            let label = match cls {
+                0xff => "Vendor-specific",
+                0x02 => "CDC Communications",
+                0x0a => "CDC Data",
+                0x03 => "HID",
+                _    => "Other",
+            };
+            format!("#{} {label} (0x{cls:02x})", i.interface_number())
+        })
+        .collect();
+    if !ifaces.is_empty() {
+        info.insert("Interfaces".into(), ifaces.join(", "));
+    }
+
+    // Windows-only: which kernel driver currently owns the device. For FTDI
+    // boards the expected values are "FTDIBUS" (VCP unloaded) or "ftser2k" /
+    // "ftdibus + Serial" (VCP loaded → COMx visible). Reveals when the driver
+    // is missing without having to open Device Manager.
+    #[cfg(windows)]
+    if let Some(drv) = dev.driver() {
+        if !drv.is_empty() {
+            info.insert("Driver".into(), drv.into());
+        }
+    }
+
+    Ok(info)
+}
+
+fn ftdi_chip_variant(pid: u16, bcd_device: u16) -> &'static str {
+    // bcdDevice encodes the FTDI silicon revision; for PID 0x6001 (FT232x
+    // family) the meaningful values are 0x0200/0x0400/0x0600. The R and RL
+    // share 0x0600 — they're the same die in different packages, so listing
+    // them together is correct.
+    match (pid, bcd_device) {
+        (0x6001, 0x0200) => "FT8U232AM",
+        (0x6001, 0x0400) => "FT232BM",
+        (0x6001, 0x0600) => "FT232R / FT232RL",
+        _ => "",
+    }
+}
+
+fn print_ftdi_info(info: &HashMap<String, String>, board_name: &str) {
+    println!("  {:<20} {}", "Board:", board_name);
+    let order = [
+        "Manufacturer",
+        "Product",
+        "Serial number",
+        "Chip variant",
+        "Interfaces",
+        "Driver",
+        "VID:PID",
+    ];
+    for k in order {
+        if let Some(v) = info.get(k) {
+            println!("  {:<20} {}", format!("{k}:"), v);
+        }
+    }
+}
+
+fn print_stm32_info(info: &HashMap<String, String>, board_name: &str) {
+    println!("  {:<20} {}", "Bridge:", board_name);
+    let order = [
+        ("Device ID",  "Device ID"),
+        ("Flash",      "Flash"),
+        ("RAM",        "RAM"),
+        ("System RAM", "System ROM"),
+        ("Option RAM", "Option RAM"),
+        ("Option 1",   "Option byte 1"),
+        ("Option 2",   "Option byte 2"),
+        ("Version",    "Bootloader ver"),
+    ];
+    for (key, label) in order {
+        if let Some(v) = info.get(key) {
+            println!("  {:<20} {}", format!("{label}:"), v);
+        }
+    }
 }
 
 fn find_picotool() -> PathBuf {
@@ -1127,6 +1481,15 @@ enum InstallStep {
         url: &'static str,
         instructions: &'static str,
     },
+    /// Extract an archive that's already committed to `windows-driver/` in
+    /// the repo — no network round-trip. Use for upstreams whose only
+    /// distribution channel is awkward (e.g. SourceForge HTML redirects).
+    /// The file lives at `<project>/windows-driver/<filename>` regardless of
+    /// host OS (that path is the project's canonical bundled-binary dir).
+    LocalArchive {
+        filename: &'static str,
+        action: DownloadAction,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1212,6 +1575,12 @@ const FTDI_INSTRUCTIONS: &str =
      \n\
      Chocolatey users can instead run:  choco install ftdi-drivers";
 
+// stm32flash upstream lives on SourceForge whose download URLs require
+// browser-side redirects, so instead of auto-downloading we ship the
+// upstream v0.7 binary zip in windows-driver/ (227 KB, three-OS bundle:
+// stm32flash.exe + stm32flash_linux + stm32flash_macos) and just extract it.
+const STM32FLASH_BUNDLE: &str = "stm32flash-0.7-binaries.zip";
+
 const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         id: "espflash",
@@ -1294,6 +1663,26 @@ const TOOLS: &[ToolSpec] = &[
         check_command: Some("avrdude"),
     },
     ToolSpec {
+        id: "stm32flash",
+        name: "stm32flash",
+        purpose: "STM32 / GD32 (and bootloader-compatible clones) chip ID & flashing via UART bootloader. Bundled v0.7 zip ships binaries for Windows, Linux, and macOS.",
+        // The bundled zip carries all three OS binaries; the per-OS
+        // binary_hint just tells the post-extract scan which file to highlight.
+        resolve: |os| Some(InstallStep::LocalArchive {
+            filename: STM32FLASH_BUNDLE,
+            action: DownloadAction::ExtractToBundle {
+                binary_hint: match os {
+                    Os::Windows => "stm32flash.exe",
+                    Os::Linux   => "stm32flash_linux",
+                    Os::Macos   => "stm32flash_macos",
+                },
+            },
+        }),
+        // Bundled binary isn't on PATH — find_stm32flash() locates it at runtime
+        // (similar to find_picotool()), so a `which`-style probe would be misleading.
+        check_command: None,
+    },
+    ToolSpec {
         id: "ravedude",
         name: "ravedude",
         purpose: "avr-hal `cargo run` runner — wraps avrdude to flash Rust AVR firmware & open a serial monitor.",
@@ -1372,6 +1761,7 @@ fn cmd_list_tools() -> Result<()> {
             Some(InstallStep::Command { program, .. }) => program,
             Some(InstallStep::Download { .. }) => "download",
             Some(InstallStep::Manual { .. }) => "manual",
+            Some(InstallStep::LocalArchive { .. }) => "bundled",
             None => "(n/a on this OS)",
         };
         println!("{:<12}  {:<10}  {:<10}  {}", tool.id, status, provider, tool.purpose);
@@ -1426,43 +1816,23 @@ fn cmd_install(tool_id: &str) -> Result<()> {
             });
             let dest = dest_dir.join(fname);
             download_file(url, &dest)?;
-            match action {
-                DownloadAction::ExtractToBundle { binary_hint } => {
-                    let extract_to = dest_dir.join(tool.id);
-                    std::fs::create_dir_all(&extract_to)?;
-                    extract_zip(&dest, &extract_to)?;
-                    println!("\n  Extracted to: {}", extract_to.display());
-                    match find_in_dir(&extract_to, binary_hint) {
-                        Some(p) => println!("  Binary:       {}", p.display()),
-                        None => println!(
-                            "  Binary '{binary_hint}' not found inside archive — inspect the directory manually."
-                        ),
-                    }
-                }
-                DownloadAction::ExtractAndPrompt { binary_hint, instructions } => {
-                    let extract_to = dest_dir.join(tool.id);
-                    std::fs::create_dir_all(&extract_to)?;
-                    extract_zip(&dest, &extract_to)?;
-                    println!("\n  Extracted to: {}", extract_to.display());
-                    match find_in_dir(&extract_to, binary_hint) {
-                        Some(p) => println!("  Installer:    {}", p.display()),
-                        None => println!(
-                            "  Installer '{binary_hint}' not found — inspect the directory manually."
-                        ),
-                    }
-                    println!("\n  Manual steps:");
-                    for line in instructions.lines() {
-                        println!("    {line}");
-                    }
-                }
-                DownloadAction::PromptToRun { instructions } => {
-                    println!("\n  Saved to: {}", dest.display());
-                    println!("\n  Manual steps:");
-                    for line in instructions.lines() {
-                        println!("    {line}");
-                    }
-                }
+            apply_download_action(tool.id, &dest, &dest_dir, action)?;
+        }
+        InstallStep::LocalArchive { filename, action } => {
+            let src = local_archive_path(filename)?;
+            if !src.is_file() {
+                anyhow::bail!(
+                    "Bundled archive missing: {}\n\
+                     Re-clone the repository or place the file there manually.",
+                    src.display()
+                );
             }
+            let size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+            println!("  Source:      {} ({} bytes, bundled)", src.display(), size);
+            let dest_dir = bundle_dir()?;
+            std::fs::create_dir_all(&dest_dir)
+                .with_context(|| format!("Could not create {}", dest_dir.display()))?;
+            apply_download_action(tool.id, &src, &dest_dir, action)?;
         }
         InstallStep::Manual { url, instructions } => {
             println!("  Download URL: {url}");
@@ -1474,6 +1844,65 @@ fn cmd_install(tool_id: &str) -> Result<()> {
     }
     println!("\n  Done.");
     Ok(())
+}
+
+fn apply_download_action(
+    tool_id: &str,
+    src: &Path,
+    dest_dir: &Path,
+    action: DownloadAction,
+) -> Result<()> {
+    match action {
+        DownloadAction::ExtractToBundle { binary_hint } => {
+            let extract_to = dest_dir.join(tool_id);
+            std::fs::create_dir_all(&extract_to)?;
+            extract_zip(src, &extract_to)?;
+            println!("\n  Extracted to: {}", extract_to.display());
+            match find_in_dir(&extract_to, binary_hint) {
+                Some(p) => println!("  Binary:       {}", p.display()),
+                None => println!(
+                    "  Binary '{binary_hint}' not found inside archive — inspect the directory manually."
+                ),
+            }
+        }
+        DownloadAction::ExtractAndPrompt { binary_hint, instructions } => {
+            let extract_to = dest_dir.join(tool_id);
+            std::fs::create_dir_all(&extract_to)?;
+            extract_zip(src, &extract_to)?;
+            println!("\n  Extracted to: {}", extract_to.display());
+            match find_in_dir(&extract_to, binary_hint) {
+                Some(p) => println!("  Installer:    {}", p.display()),
+                None => println!(
+                    "  Installer '{binary_hint}' not found — inspect the directory manually."
+                ),
+            }
+            println!("\n  Manual steps:");
+            for line in instructions.lines() {
+                println!("    {line}");
+            }
+        }
+        DownloadAction::PromptToRun { instructions } => {
+            println!("\n  Saved to: {}", src.display());
+            println!("\n  Manual steps:");
+            for line in instructions.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bundled archives (committed to the repo) always live under
+/// `<project>/windows-driver/` regardless of host OS — that's the project's
+/// canonical home for binary blobs (see CLAUDE.md).
+fn local_archive_path(filename: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let project = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Could not derive project root from exe path"))?;
+    Ok(project.join("windows-driver").join(filename))
 }
 
 fn bundle_dir() -> Result<PathBuf> {

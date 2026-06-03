@@ -2,8 +2,8 @@
 
 USB device inspector with chip-level board probing. Lists connected USB
 devices in the same format as `usbipd list`, then drills into each one with
-the right protocol-specific tool — `espflash`, `avrdude`, `picotool`,
-DAPLink `DETAILS.TXT`, or `pyocd`.
+the right protocol-specific tool — `espflash`, `stm32flash`, `avrdude`,
+`picotool`, DAPLink `DETAILS.TXT`, or `pyocd`.
 
 > **Status:** built and used daily on Windows 11 with `usbipd-win`.
 > macOS / Linux builds compile and ship from CI, but the listing layer
@@ -15,14 +15,15 @@ DAPLink `DETAILS.TXT`, or `pyocd`.
 ## Highlights
 
 - One command to inspect every connected USB device — VID:PID, BUSID, COM port, USB speed, attach state.
-- Five probe back-ends, dispatched by VID:PID:
+- Six probe back-ends, dispatched by VID:PID:
   - **`espflash`** — ESP32 / ESP32-S2 / S3 / C3 / H2 chip ID, MAC, flash size, features.
+  - **`stm32flash`** — STM32 / GD32 (and bootloader-compatible clones) Device ID, flash / RAM size, option bytes via UART system bootloader.
   - **`avrdude`** — ATmega328P / 328PB / 2560 / 32U4 signature, programmer type, bootloader version.
   - **`picotool`** — RP2040 / RP2350 chip rev, package, flash size, ROM gitrev, dual-arch ARM/RISC-V info.
   - **DAPLink** — read `DETAILS.TXT` from the mass-storage drive (zero deps), decode board variant + target.
   - **`pyocd`** — cross-check the SWD-side target chip via pyOCD's board database (no chip reset).
 - Boards can chain probes — micro:bit V2 runs both `DETAILS.TXT` *and* `pyocd` for cross-verification.
-- Built-in installer for the nine external tools (downloads from upstream, extracts, prints UAC-aware instructions).
+- Built-in installer for the ten external tools (downloads from upstream, extracts, prints UAC-aware instructions).
 - Cross-platform builds via GitHub Actions: Windows x86_64, macOS aarch64, Linux x86_64, Linux aarch64.
 
 ## Example output
@@ -57,10 +58,10 @@ metadata and USB serial-number → board database lookup.)
 
 | VID:PID family            | Board                                | Probe                       |
 | ------------------------- | ------------------------------------ | --------------------------- |
-| `10C4:EA60` / `EA70` / `EA71` | Silabs CP210x bridge             | `espflash`                  |
-| `1A86:7523` / `55D4`      | WCH CH340 / CH9102                   | `espflash`                  |
-| `0403:6010` / `6014` / `6015` | FTDI FT2232 / FT232H / FT231X    | `espflash`                  |
-| `0403:6001`               | FTDI FT232R (Arduino Nano/Duemilanove) | `avrdude`                 |
+| `10C4:EA60` / `EA70` / `EA71` | Silabs CP210x bridge             | `espflash` → `stm32flash` → `avrdude` |
+| `1A86:7523` / `55D4`      | WCH CH340 / CH9102                   | `espflash` → `stm32flash` → `avrdude` |
+| `0403:6010` / `6014` / `6015` | FTDI FT2232 / FT232H / FT231X    | `espflash` → `stm32flash` → `avrdude` |
+| `0403:6001`               | FTDI FT232R (Arduino Nano/Duemilanove) | `nusb` descriptors → `avrdude` |
 | `303A:1001` / `4001`      | ESP32 native USB-Serial-JTAG / OTG   | `espflash`                  |
 | `2341:0001` / `0043`      | Arduino Uno R1 / R3                  | `avrdude`                   |
 | `2341:0010` / `0042` / `0044` | Arduino Mega 2560 / Mega ADK     | `avrdude`                   |
@@ -118,15 +119,16 @@ usbipd-rs --help               # full reference
 
 | ID         | Provider                              | Use case                                  |
 | ---------- | ------------------------------------- | ----------------------------------------- |
-| `espflash` | `cargo install espflash`              | ESP32 chip identification / flashing      |
-| `pyocd`    | `pip install pyocd`                   | CMSIS-DAP / DAPLink target chip ID        |
-| `picotool` | GitHub release zip                    | Pi Pico (RP2040 / RP2350) inspection      |
-| `avrdude`  | GitHub release zip / brew / apt       | AVR (Arduino) chip ID & flashing          |
-| `ravedude` | `cargo install ravedude`              | avr-hal `cargo run` runner (Rust AVR dev) |
-| `zadig`    | libwdi GitHub release                 | Win-only: replace USB driver → WinUSB     |
-| `cp210x`   | silabs.com universal driver           | Win-only: CP2102/CP2104 VCP driver        |
-| `ch340`    | wch-ic.com `CH341SER.EXE`             | Win-only: CH340/CH341 USB-Serial driver   |
-| `ftdi`     | ftdichip.com CDM (manual download)    | Win-only: FTDI FT232R VCP driver          |
+| `espflash`   | `cargo install espflash`              | ESP32 chip identification / flashing             |
+| `pyocd`      | `pip install pyocd`                   | CMSIS-DAP / DAPLink target chip ID               |
+| `picotool`   | GitHub release zip                    | Pi Pico (RP2040 / RP2350) inspection             |
+| `avrdude`    | GitHub release zip / brew / apt       | AVR (Arduino) chip ID & flashing                 |
+| `stm32flash` | bundled zip in `windows-driver/`      | STM32 / GD32 UART-bootloader chip ID & flashing (Win / Linux / macOS binaries) |
+| `ravedude`   | `cargo install ravedude`              | avr-hal `cargo run` runner (Rust AVR dev)        |
+| `zadig`      | libwdi GitHub release                 | Win-only: replace USB driver → WinUSB            |
+| `cp210x`     | silabs.com universal driver           | Win-only: CP2102/CP2104 VCP driver               |
+| `ch340`      | wch-ic.com `CH341SER.EXE`             | Win-only: CH340/CH341 USB-Serial driver          |
+| `ftdi`       | ftdichip.com CDM (manual download)    | Win-only: FTDI FT232R VCP driver                 |
 
 Files cache under `windows-driver/` (Windows) or `tools/` (macOS / Linux);
 re-running `--install <id>` reuses an existing download — delete it to
