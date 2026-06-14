@@ -1,3 +1,9 @@
+// The Windows USB driver-binding diagnostics (--driver-status, --install-driver,
+// stlink_driver_check, …) are compiled on every OS but only *used* behind
+// #[cfg(windows)]. On other targets they are legitimately dead code, so relax
+// the lint there; Windows (the primary platform) still enforces -D dead_code.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use anyhow::{Context, Result};
 use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
 use nusb::{Endpoint, MaybeFuture};
