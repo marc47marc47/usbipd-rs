@@ -1,6 +1,6 @@
 [package]
 name = "usbipd-rs"
-version = "0.3.3"
+version = "0.4.1"
 edition = "2021"
 description = "Inspect connected USB hardware with native cross-platform enumeration."
 license = "GPL-3.0-only"
