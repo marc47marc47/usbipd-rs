@@ -1,0 +1,10 @@
+# Chip-ID file for STM32F103x8/xB medium-density ("Blue Pill") — usbipd-rs
+#
+# See F446.chip for the format. chip_id 0x410 is STM32F1 medium density.
+
+dev_type STM32F103x8_xB
+chip_id 0x410
+flash_type F0_F1_F3
+flash_size_reg 0x1ffff7e0
+sram_size 0x5000             // 20 KB
+option_base 0x40022000

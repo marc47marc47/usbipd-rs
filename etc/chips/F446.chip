@@ -1,0 +1,18 @@
+# Chip-ID file for STM32F446 (Nucleo-F446RE target) — usbipd-rs --mcu-alive-native
+#
+# Format is a subset of stlink-org/stlink's .chip files; unknown keys are
+# ignored, so a real stlink chip file also works here. A model with a matching
+# chip_id here overrides the program's built-in family table.
+#
+#   chip_id        DBGMCU DEV_ID (low 12 bits of 0xE0042000), the match key
+#   dev_type       human name shown as "Device ID"
+#   flash_type     family group (informational; UID/RDP addrs come from built-in)
+#   flash_size_reg address of the 16-bit flash-size field (F_SIZE)
+#   sram_size      main SRAM in bytes (shown as KB)
+
+dev_type STM32F446
+chip_id 0x421
+flash_type F2_F4
+flash_size_reg 0x1fff7a22
+sram_size 0x20000            // 128 KB
+option_base 0x40023c14

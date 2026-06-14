@@ -1,0 +1,10 @@
+# Chip-ID file for STM32F401xB/xC — usbipd-rs --mcu-alive-native
+#
+# See F446.chip for the format. chip_id 0x423 is STM32F401xB/xC.
+
+dev_type STM32F401xB_xC
+chip_id 0x423
+flash_type F2_F4
+flash_size_reg 0x1fff7a22
+sram_size 0x10000            // 64 KB
+option_base 0x40023c14

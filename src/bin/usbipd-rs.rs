@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
+use nusb::transfer::{Buffer, Bulk, In, Out};
+use nusb::{Endpoint, MaybeFuture};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use unicode_width::UnicodeWidthStr;
 
-const HEADERS: [&str; 5] = ["BUSID", "VID:PID", "DEVICE", "STATE", "SPEED"];
+const HEADERS: [&str; 4] = ["BUSID", "VID:PID", "DEVICE", "SPEED"];
 
 /// One avrdude connection attempt: an MCU paired with the bootloader
 /// programmer that drives it, plus the sync baud rates to try (in order).
@@ -43,6 +45,15 @@ enum ProbeKind {
     Picotool,
     Daplink,
     Pyocd,
+    /// Identify the USB-visible ST-Link debug controller itself (layer 1) from
+    /// its VID:PID and cached USB descriptors. This is deliberately
+    /// non-invasive: it does not open the debug interface, issue SWD/JTAG
+    /// commands, halt a target, or reset either MCU.
+    Stlink,
+    /// Explicit opt-in downstream SWD target probe (layer 2). Reads identity,
+    /// flash-size, UID, and read-protection registers, then resets the target
+    /// to resume firmware. Never erases, unlocks, dumps, or writes flash.
+    StlinkTarget,
 }
 
 impl ProbeKind {
@@ -63,6 +74,8 @@ impl ProbeKind {
             ProbeKind::Picotool => "picotool",
             ProbeKind::Daplink => "DETAILS.TXT",
             ProbeKind::Pyocd => "pyocd",
+            ProbeKind::Stlink => "nusb (layer 1 only)",
+            ProbeKind::StlinkTarget => "native SWD (layer 2)",
         }
     }
 }
@@ -84,6 +97,7 @@ const ESP: &[ProbeKind] = &[ProbeKind::Espflash];
 const PICO: &[ProbeKind] = &[ProbeKind::Picotool];
 const DFU: &[ProbeKind] = &[ProbeKind::Dfu];
 const DAP_PIPELINE: &[ProbeKind] = &[ProbeKind::Daplink, ProbeKind::Pyocd];
+const STLINK: &[ProbeKind] = &[ProbeKind::Stlink, ProbeKind::StlinkTarget];
 
 // A generic USB-UART bridge (CH340, CP210x, FT2232/FT232H/FT231X) carries no
 // information about which MCU is wired to its TX/RX lines — the same chip
@@ -181,6 +195,12 @@ const KNOWN_BOARDS: &[KnownBoard] = &[
     // Read DETAILS.TXT from MSD first, then ask pyocd what target chip is on
     // the other end of the SWD lines (board database lookup; no chip reset).
     KnownBoard { vid: 0x0d28, pid: 0x0204, name: "DAPLink (mbed CMSIS-DAP)", probes: DAP_PIPELINE },
+
+    // ── ST-Link debug controllers (layer 1 only; downstream target disabled) ──
+    KnownBoard { vid: 0x0483, pid: 0x3748, name: "ST-Link/V2 debug controller",   probes: STLINK },
+    KnownBoard { vid: 0x0483, pid: 0x374b, name: "ST-Link/V2-1 debug controller", probes: STLINK },
+    KnownBoard { vid: 0x0483, pid: 0x374e, name: "ST-Link/V3 debug controller",   probes: STLINK },
+    KnownBoard { vid: 0x0483, pid: 0x374f, name: "ST-Link/V3 debug controller",   probes: STLINK },
 ];
 
 fn lookup_board(vid: u16, pid: u16) -> Option<&'static KnownBoard> {
@@ -201,6 +221,19 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--list-tools") {
         return cmd_list_tools();
     }
+    if args.iter().any(|a| a == "--driver-status") {
+        return cmd_driver_status();
+    }
+    if args.iter().any(|a| a == "--install-driver") {
+        let confirm = args.iter().any(|a| matches!(a.as_str(), "--confirm" | "--yes" | "-y"));
+        return cmd_install_driver(confirm);
+    }
+    if args.iter().any(|a| a == "--mcu-alive-native") {
+        return cmd_mcu_alive_native();
+    }
+    if args.iter().any(|a| a == "--mcu-alive") {
+        return cmd_mcu_alive();
+    }
     if let Some(idx) = args.iter().position(|a| a == "--install") {
         let tool = args.get(idx + 1).map(String::as_str).unwrap_or("");
         if tool.is_empty() {
@@ -219,7 +252,13 @@ USAGE:
     usbipd-rs                       List connected USB devices and detect probable boards.
     usbipd-rs --probe               List, then probe each detected board (chip-level info).
                                     Bridge boards (CH340/CP210x/FT232) probe in fail-fast
-                                    order: espflash → stm32flash → avrdude.
+                                    order: espflash → stm32flash → avrdude. For an ST-Link
+                                    it also auto-detects a downstream SWD/JTAG target and
+                                    shows a second layer when one is present (read-only).
+    usbipd-rs --mcu-alive           Minimal read-only ST-Link/SWD target-alive test.
+    usbipd-rs --mcu-alive-native    Same, but native nusb (no probe-rs/pyocd needed).
+    usbipd-rs --driver-status       Diagnose Windows USB interface driver bindings.
+    usbipd-rs --install-driver      Dry-run (or --confirm) bind the ST-Link MI_00 driver.
     usbipd-rs --list-tools          Show install status of all probe-tool dependencies.
     usbipd-rs --install <ID>        Download/install one tool by its ID.
     usbipd-rs --help                Show this help.
@@ -228,7 +267,33 @@ USAGE:
 OPTIONS:
     -p, --probe                Probe each detected board with the matching chip-level
                                tool (espflash, stm32flash, avrdude, picotool, DAPLink,
-                               pyocd). Aliases: --probe-esp, --probe-arduino.
+                               pyocd). Aliases: --probe-esp, --probe-arduino. For an
+                               ST-Link it automatically adds a read-only second layer:
+                               it enters SWD natively (nusb), and if a target MCU
+                               answers it prints the target identity; if none answers
+                               it reports a one-layer result. No chip reset/halt.
+        --mcu-alive            Minimal ST-Link test: verify USB probe, open debug
+                               interface, then perform a 100 kHz SWD discovery scan.
+                               Does not request target reset, halt, flash read/write,
+                               erase, or unlock.
+        --mcu-alive-native     Same goal with NO external tool: speaks the ST-Link
+                               bulk protocol directly via nusb (enter SWD, read
+                               DPIDR / CPUID / DBGMCU IDCODE + flash/UID/RDP, all
+                               read-only). On Windows needs only WinUSB on MI_00
+                               (--install-driver) — no probe-rs, pyocd, or vendor
+                               driver. If MI_00 has no driver it reports the exact
+                               transfer boundary instead of guessing. STM32 models
+                               are identified from a built-in family table, which
+                               optional etc/chips/*.chip files extend or override
+                               (a matching .chip wins).
+        --driver-status        Windows: show every present USB interface's service,
+                               INF/provider, problem code, classified issue, safe next
+                               action, and local/driver-store INF availability.
+        --install-driver       Windows: install the bundled WinUSB INF for the ST-Link
+                               MI_00 debug interface ONLY. Dry-run by default (shows the
+                               exact interface and pnputil command); pass --confirm
+                               (alias -y) in an Administrator shell to apply, then it
+                               re-checks the node recovered without a reboot.
         --list-tools           List installable tools, their OS provider (cargo / pip /
                                brew / apt / download / manual) and install status.
         --install <ID>         Install one tool by ID. See --list-tools for IDs.
@@ -248,6 +313,7 @@ WHAT GETS DETECTED (VID:PID → board → probe):
     2E8A:0003                     RP2040 BOOTSEL (Pi Pico)   → RP2  (picotool)
     2E8A:000F                     RP2350 BOOTSEL (Pi Pico 2) → RP2  (picotool)
     0D28:0204                     mbed CMSIS-DAP / DAPLink   → DAP+SWD (DETAILS.TXT + pyocd)
+    0483:3748 / 374B / 374E / 374F ST-Link V2 / V2-1 / V3    → STL (layer-1 controller architecture; no SWD/JTAG IO)
 
 INSTALLABLE TOOLS (see --list-tools for live status):
     espflash    cargo install espflash         ESP chip identification & flashing
@@ -270,8 +336,21 @@ EXAMPLES:
     # Listing only — no chip reset, safe to run any time
     usbipd-rs
 
-    # Full probe — gets chip type, revision, flash size, MAC, etc.
+    # Full probe — chip type, revision, flash size, MAC, etc. For an ST-Link it
+    # auto-detects and shows the downstream SWD target (read-only) when present.
     usbipd-rs --probe
+
+    # Minimal test that the target MCU responds through ST-Link/SWD
+    usbipd-rs --mcu-alive
+
+    # Prove USB hardware enumeration and diagnose missing/broken Windows drivers
+    usbipd-rs --driver-status
+
+    # Preview exactly what an ST-Link MI_00 driver install would change (no writes)
+    usbipd-rs --install-driver
+
+    # Apply it (Administrator shell), then auto-verify recovery without reboot
+    usbipd-rs --install-driver --confirm
 
     # Install picotool from upstream Raspberry Pi release
     usbipd-rs --install picotool
@@ -283,8 +362,10 @@ EXAMPLES:
     usbipd-rs --install zadig
 
 NOTES:
-    * --probe asserts DTR/RTS or SWD reset → resets target chip. Do NOT run
-      while a 3D-printer or other live firmware is talking on the same port.
+    * --probe's ST-Link layer-2 step is read-only (native SWD over nusb): it
+      enters SWD and reads ID registers only — no halt, reset, erase, or write.
+      On Windows it needs WinUSB on MI_00 (see --install-driver); without it the
+      layer-2 line just reports the missing binding.
     * stm32flash probing requires the chip in system bootloader mode
       (BOOT0=HIGH at reset). CH340/CP210x boards typically don't wire DTR/RTS
       to BOOT0, so the probe can't trigger bootloader entry automatically — if
@@ -299,8 +380,7 @@ NOTES:
       those installers.
 
 DATA SOURCES:
-    USB enumeration   nusb (cross-platform USB lib) on macOS/Linux;
-                      usbipd.exe list (Windows, for share/attach STATE)
+    USB enumeration   nusb (cross-platform native USB enumeration)
     COM-port mapping  serialport crate
     Bundled binaries  windows-driver/picotool/, windows-driver/avrdude/, ...
 "#;
@@ -314,7 +394,7 @@ fn cmd_list_usb() -> Result<()> {
     let entries = list_entries()?;
     let nusb_devs = nusb_by_vidpid();
 
-    let rows: Vec<[String; 5]> = entries
+    let rows: Vec<[String; 4]> = entries
         .iter()
         .map(|e| {
             let speed = nusb_devs
@@ -326,7 +406,6 @@ fn cmd_list_usb() -> Result<()> {
                 e.busid.clone(),
                 e.vidpid.clone(),
                 e.device.clone(),
-                e.state.clone(),
                 speed,
             ]
         })
@@ -369,6 +448,8 @@ fn cmd_list_usb() -> Result<()> {
                     ProbeKind::Picotool => "RP2",
                     ProbeKind::Daplink => "DAP",
                     ProbeKind::Pyocd => "SWD",
+                    ProbeKind::Stlink => "STL",
+                    ProbeKind::StlinkTarget => "SWD2",
                 })
                 .collect();
             println!(
@@ -383,6 +464,13 @@ fn cmd_list_usb() -> Result<()> {
         println!("Run with --probe to query each board (espflash / stm32flash / avrdude / picotool / DAPLink / pyocd).");
         println!("Note: probing may reset the chip — do NOT use while a 3D-printer or");
         println!("      other live firmware is communicating.");
+        if candidates.iter().any(|(e, _)| e.vidpid.starts_with("0483:374")) {
+            println!();
+            println!("ST-Link present — safe, read-only options (no chip reset):");
+            println!("  --mcu-alive-native   read target ID over SWD via nusb (no probe-rs/pyocd).");
+            println!("  --driver-status      check the MI_00 debug-interface driver binding (Windows).");
+            println!("  --install-driver     bind WinUSB to MI_00 if --mcu-alive-native can't claim it.");
+        }
     }
     Ok(())
 }
@@ -427,15 +515,14 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 continue;
             }
 
-            // For non-serial probes the FTDI descriptor probe identifies the
-            // device by VID:PID rather than a COM port, so surface that in the
-            // header; other libusb-based probes keep the generic placeholder.
-            let header_port: &str = if let Some(p) = port_name.as_deref() {
-                p
-            } else if matches!(probe, ProbeKind::Ftdi | ProbeKind::Dfu) {
-                entry.vidpid.as_str()
-            } else {
-                "(via libusb)"
+            // Serial probes show the COM port; USB-direct probes (FTDI / DFU /
+            // pyocd / picotool / ST-Link …) identify the device by VID:PID.
+            // (This used to print "(via libusb)", which confused users into
+            // thinking the ST-Link wasn't on WinUSB — but libusb on Windows *is*
+            // the WinUSB access path. VID:PID is unambiguous.)
+            let header_port: &str = match port_name.as_deref() {
+                Some(p) => p,
+                None => entry.vidpid.as_str(),
             };
             println!(
                 "\n[{}  {}  {}  via {}]",
@@ -453,6 +540,8 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 ProbeKind::Picotool => run_picotool_info(vid, pid),
                 ProbeKind::Daplink => run_daplink_query(),
                 ProbeKind::Pyocd => run_pyocd_query(vid, pid),
+                ProbeKind::Stlink => run_stlink_controller_query(vid, pid),
+                ProbeKind::StlinkTarget => run_stlink_target_query(vid, pid),
             };
 
             match result {
@@ -469,6 +558,8 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                         ProbeKind::Picotool => print_pico_info(&info, board.name),
                         ProbeKind::Daplink => print_daplink_info(&info, board.name),
                         ProbeKind::Pyocd => print_pyocd_info(&info),
+                        ProbeKind::Stlink => print_stlink_controller_info(&info),
+                        ProbeKind::StlinkTarget => print_stlink_target_info(&info, board.name),
                     }
                 }
                 Ok(_) => println!("  (no info parsed from output)"),
@@ -483,6 +574,102 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                     }
                 }
             }
+        }
+    }
+
+    print_probe_install_suggestions(candidates);
+}
+
+/// The driver a detected board needs so the host can talk to it (Windows only;
+/// other OSes ship kernel modules / use udev). Returns `(what, install command)`.
+fn driver_suggestion(vid: u16, pid: u16) -> Option<(&'static str, String)> {
+    match vid {
+        0x0483 if (0x3748..=0x3757).contains(&pid) => match stlink_driver_check(pid) {
+            // Already bound to WinUSB — nothing to install.
+            Some(StlinkDriver::WinUsb) => None,
+            _ => Some((
+                "WinUSB on the ST-Link MI_00 debug interface",
+                "usbipd-rs --install-driver --confirm   (run in an Administrator shell)".into(),
+            )),
+        },
+        0x0483 if pid == 0xdf11 => Some((
+            "WinUSB for the STM32 DFU bootloader (Zadig)",
+            "usbipd-rs --install zadig".into(),
+        )),
+        0x1a86 => Some(("WCH CH340 / CH9102 USB-serial driver", "usbipd-rs --install ch340".into())),
+        0x10c4 => Some(("Silicon Labs CP210x VCP driver", "usbipd-rs --install cp210x".into())),
+        0x0403 => Some(("FTDI VCP driver", "usbipd-rs --install ftdi".into())),
+        0x2e8a => Some(("WinUSB on the RP2 BOOTSEL interface (Zadig)", "usbipd-rs --install zadig".into())),
+        _ => None,
+    }
+}
+
+/// The Rust-based flashing tool that fits a detected board, chosen by its first
+/// probe kind. Returns `(what, cargo install command)`.
+fn flasher_suggestion(board: &KnownBoard) -> Option<(&'static str, String)> {
+    for p in board.probes {
+        return Some(match p {
+            ProbeKind::Espflash => ("espflash — ESP flashing & board-info (Rust)", "cargo install espflash".into()),
+            ProbeKind::Avrdude { .. } => ("ravedude — AVR `cargo run` flasher (Rust)", "cargo install ravedude".into()),
+            ProbeKind::Stlink
+            | ProbeKind::StlinkTarget
+            | ProbeKind::Pyocd
+            | ProbeKind::Daplink
+            | ProbeKind::Stm32Flash
+            | ProbeKind::Dfu
+            | ProbeKind::Picotool => ("probe-rs — SWD/JTAG flash & debug (Rust)", "cargo install probe-rs-tools".into()),
+            // FTDI is a descriptor-only probe; keep looking for a flashable kind.
+            ProbeKind::Ftdi => continue,
+        });
+    }
+    None
+}
+
+/// Print, at the end of `--probe`, the two things a user typically still needs:
+/// (1) the driver so the host can reach the board, and (2) a Rust flashing tool.
+fn print_probe_install_suggestions(candidates: &[(&Entry, &'static KnownBoard)]) {
+    let mut flashers: Vec<(&str, String)> = Vec::new();
+    for (_, b) in candidates {
+        if let Some(s) = flasher_suggestion(b) {
+            if !flashers.iter().any(|(_, c)| *c == s.1) {
+                flashers.push(s);
+            }
+        }
+    }
+
+    println!("\n=== Suggested installs ===");
+
+    println!("1. Driver — let the host talk to the board:");
+    if current_os() == Os::Windows {
+        let mut drivers: Vec<(&str, String)> = Vec::new();
+        for (e, _) in candidates {
+            let (vid, pid) = e.vidpid_pair();
+            if let Some(s) = driver_suggestion(vid, pid) {
+                if !drivers.iter().any(|(_, c)| *c == s.1) {
+                    drivers.push(s);
+                }
+            }
+        }
+        if drivers.is_empty() {
+            println!("   - detected board(s) already have a working driver.");
+        } else {
+            for (what, cmd) in drivers {
+                println!("   - {what}");
+                println!("       {cmd}");
+            }
+        }
+    } else {
+        println!("   - no Windows-style driver needed on this OS (kernel modules are built in).");
+        println!("     For SWD probes, ensure udev rules / group permissions allow USB access.");
+    }
+
+    println!("2. Rust flashing tool:");
+    if flashers.is_empty() {
+        println!("   - no Rust flasher mapping for the detected board(s).");
+    } else {
+        for (what, cmd) in flashers {
+            println!("   - {what}");
+            println!("       {cmd}");
         }
     }
 }
@@ -821,6 +1008,7 @@ fn run_ftdi_info(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
     // product/serial strings via setupapi, but not the manufacturer string
     // (that field will be None on Win regardless of descriptor contents).
     let dev = nusb::list_devices()
+        .wait()
         .context("nusb::list_devices() failed")?
         .find(|d| d.vendor_id() == vid && d.product_id() == pid)
         .ok_or_else(|| {
@@ -1488,6 +1676,752 @@ fn print_pyocd_info(info: &HashMap<String, String>) {
     }
 }
 
+struct StlinkControllerProfile {
+    generation: &'static str,
+    controller_mcu: &'static str,
+    core: &'static str,
+    architecture: &'static str,
+    max_clock: &'static str,
+    flash: &'static str,
+    sram: &'static str,
+    package: &'static str,
+    supply: &'static str,
+    flash_map: &'static str,
+    sram_map: &'static str,
+    system_memory: &'static str,
+    option_bytes: &'static str,
+    unique_id: &'static str,
+    self_debug: &'static str,
+    upstream: &'static str,
+    downstream: &'static str,
+    confidence: &'static str,
+}
+
+fn stlink_controller_profile(pid: u16) -> Option<StlinkControllerProfile> {
+    Some(match pid {
+        0x3748 => StlinkControllerProfile {
+            generation: "ST-Link/V2",
+            controller_mcu: "STM32F103C8T6/CBT6 (implementation-dependent)",
+            core: "Arm Cortex-M3",
+            architecture: "Armv7-M, Thumb/Thumb-2",
+            max_clock: "72 MHz",
+            flash: "64/128 KB (implementation-dependent)",
+            sram: "20 KB",
+            package: "Implementation-dependent",
+            supply: "2.0-3.6 V",
+            flash_map: "0x08000000 (size depends on controller variant)",
+            sram_map: "0x20000000-0x20004FFF",
+            system_memory: "0x1FFFF000-0x1FFFF7FF",
+            option_bytes: "0x1FFFF800-0x1FFFF80F",
+            unique_id: "96-bit UID at 0x1FFFF7E8",
+            self_debug: "PA13/SWDIO, PA14/SWCLK, NRST; external probe required",
+            upstream: "USB 2.0 Full Speed",
+            downstream: "SWD/JTAG",
+            confidence: "VID:PID identifies ST-Link/V2; exact MCU varies on clones",
+        },
+        0x374b => StlinkControllerProfile {
+            generation: "ST-Link/V2-1",
+            controller_mcu: "STM32F103CBT6",
+            core: "Arm Cortex-M3",
+            architecture: "Armv7-M, Thumb/Thumb-2",
+            max_clock: "72 MHz",
+            flash: "128 KB",
+            sram: "20 KB",
+            package: "LQFP48",
+            supply: "2.0-3.6 V",
+            flash_map: "0x08000000-0x0801FFFF",
+            sram_map: "0x20000000-0x20004FFF",
+            system_memory: "0x1FFFF000-0x1FFFF7FF",
+            option_bytes: "0x1FFFF800-0x1FFFF80F",
+            unique_id: "96-bit UID at 0x1FFFF7E8",
+            self_debug: "PA13/SWDIO, PA14/SWCLK, NRST; external probe required",
+            upstream: "USB 2.0 Full Speed composite device",
+            downstream: "SWD (Nucleo on-board target link)",
+            confidence: "Known ST-Link/V2-1 hardware profile",
+        },
+        0x374e | 0x374f => StlinkControllerProfile {
+            generation: "ST-Link/V3",
+            controller_mcu: "Not determined from VID:PID alone",
+            core: "Not determined from VID:PID alone",
+            architecture: "Implementation-dependent",
+            max_clock: "Implementation-dependent",
+            flash: "Implementation-dependent",
+            sram: "Implementation-dependent",
+            package: "Implementation-dependent",
+            supply: "Implementation-dependent",
+            flash_map: "Implementation-dependent",
+            sram_map: "Implementation-dependent",
+            system_memory: "Implementation-dependent",
+            option_bytes: "Implementation-dependent",
+            unique_id: "Implementation-dependent",
+            self_debug: "Implementation-dependent; external probe required",
+            upstream: "USB 2.0 High Speed capable",
+            downstream: "SWD/JTAG",
+            confidence: "VID:PID identifies ST-Link/V3 generation only",
+        },
+        _ => return None,
+    })
+}
+
+/// Return only the USB-visible debug-controller architecture (layer 1).
+/// This function enumerates cached descriptors and never opens the debug
+/// interface, so it cannot issue an SWD/JTAG command or touch layer 2.
+fn run_stlink_controller_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    let profile = stlink_controller_profile(pid)
+        .ok_or_else(|| anyhow::anyhow!("no layer-1 ST-Link profile for {vid:04x}:{pid:04x}"))?;
+    // Descriptor details are optional; the architecture profile remains valid
+    // from the VID:PID already present in the native USB list.
+    let dev = nusb::list_devices()
+        .wait()
+        .ok()
+        .and_then(|mut devices| devices.find(|d| d.vendor_id() == vid && d.product_id() == pid));
+
+    let mut info = HashMap::new();
+    info.insert("Layer".into(), "1 - USB debug controller".into());
+    info.insert("Generation".into(), profile.generation.into());
+    info.insert("Controller MCU".into(), profile.controller_mcu.into());
+    info.insert("Core".into(), profile.core.into());
+    info.insert("Architecture".into(), profile.architecture.into());
+    info.insert("Max clock".into(), profile.max_clock.into());
+    info.insert("Flash".into(), profile.flash.into());
+    info.insert("SRAM".into(), profile.sram.into());
+    info.insert("Package".into(), profile.package.into());
+    info.insert("Supply".into(), profile.supply.into());
+    info.insert("Flash map".into(), profile.flash_map.into());
+    info.insert("SRAM map".into(), profile.sram_map.into());
+    info.insert("System memory".into(), profile.system_memory.into());
+    info.insert("Option bytes".into(), profile.option_bytes.into());
+    info.insert("Unique ID".into(), profile.unique_id.into());
+    info.insert("Controller debug".into(), profile.self_debug.into());
+    info.insert("Upstream".into(), profile.upstream.into());
+    info.insert("Downstream".into(), profile.downstream.into());
+    info.insert("USB identity".into(), format!("{vid:04x}:{pid:04x}"));
+    info.insert("Identification".into(), profile.confidence.into());
+    info.insert(
+        "Firmware access".into(),
+        "Not attempted; read-protection status unknown".into(),
+    );
+    info.insert(
+        "Layer 2".into(),
+        "Auto-probed read-only below (native SWD)".into(),
+    );
+    if let Some(dev) = dev {
+        info.insert("Descriptor access".into(), "Available through nusb".into());
+        if let Some(product) = dev.product_string() {
+            info.insert("USB product".into(), product.into());
+        }
+        if let Some(serial) = dev.serial_number() {
+            info.insert("USB serial".into(), serial.into());
+        }
+        info.insert(
+            "USB device version".into(),
+            format!("0x{:04x}", dev.device_version()),
+        );
+    } else {
+        info.insert(
+            "Descriptor access".into(),
+            "Unavailable through nusb; VID:PID profile still shown".into(),
+        );
+    }
+    if let Some(driver) = stlink_driver_check(pid) {
+        let driver = match driver {
+            StlinkDriver::WinUsb => "WinUSB".to_string(),
+            StlinkDriver::Other(service) => service,
+        };
+        info.insert("Debug interface driver".into(), driver);
+    }
+    Ok(info)
+}
+
+fn print_stlink_controller_info(info: &HashMap<String, String>) {
+    println!("  Architecture:");
+    let order = [
+        "Layer",
+        "Generation",
+        "Controller MCU",
+        "Core",
+        "Architecture",
+        "Max clock",
+        "Flash",
+        "SRAM",
+        "Package",
+        "Supply",
+        "Flash map",
+        "SRAM map",
+        "System memory",
+        "Option bytes",
+        "Unique ID",
+        "Controller debug",
+        "Upstream",
+        "Downstream",
+        "USB identity",
+        "Descriptor access",
+        "USB product",
+        "USB serial",
+        "USB device version",
+        "Debug interface driver",
+        "Identification",
+        "Firmware access",
+        "Layer 2",
+    ];
+    for key in order {
+        if let Some(value) = info.get(key) {
+            println!("  {:<24} {}", format!("{key}:"), value);
+        }
+    }
+}
+
+/// Where a given STM32 family keeps its flash-size word, 96-bit UID, and
+/// read-out-protection option register. DBGMCU_IDCODE (0xE0042000) and CPUID
+/// (0xE000ED00) are at fixed addresses across families, but these three move,
+/// so we can only read them once DEV_ID tells us the family.
+#[derive(Clone, Copy)]
+struct StmFamily {
+    name: &'static str,
+    flash_size_addr: u32,
+    uid_addr: u32,
+    rdp_addr: u32,
+    rdp_kind: RdpKind,
+}
+
+#[derive(Clone, Copy)]
+enum RdpKind {
+    /// FLASH_OBR with RDPRT in bit 1 (STM32F0/F1/F3).
+    Obr,
+    /// FLASH_OPTCR-style register with the RDP level byte in bits [15:8]
+    /// (STM32F2/F4/F7): 0xAA = Level 0, 0xCC = Level 2, anything else = Level 1.
+    OptByte,
+}
+
+// Per-family register address groups.
+const ADDRS_F1:   (u32, u32, u32, RdpKind) = (0x1FFFF7E0, 0x1FFFF7E8, 0x4002201C, RdpKind::Obr);
+const ADDRS_F0F3: (u32, u32, u32, RdpKind) = (0x1FFFF7CC, 0x1FFFF7AC, 0x4002201C, RdpKind::Obr);
+const ADDRS_F2F4: (u32, u32, u32, RdpKind) = (0x1FFF7A22, 0x1FFF7A10, 0x40023C14, RdpKind::OptByte);
+const ADDRS_F7:   (u32, u32, u32, RdpKind) = (0x1FF0F442, 0x1FF0F420, 0x40023C14, RdpKind::OptByte);
+
+/// Map a 12-bit DBGMCU DEV_ID to its family name + register addresses.
+fn stm_family(dev_id: u16) -> Option<StmFamily> {
+    let (name, (flash_size_addr, uid_addr, rdp_addr, rdp_kind)) = match dev_id {
+        // ── STM32F0 (Cortex-M0) ──
+        0x440 => ("STM32F030x8 / F05x — Cortex-M0", ADDRS_F0F3),
+        0x442 => ("STM32F030xC / F09x — Cortex-M0", ADDRS_F0F3),
+        0x444 => ("STM32F03x — Cortex-M0", ADDRS_F0F3),
+        0x445 => ("STM32F04x — Cortex-M0", ADDRS_F0F3),
+        0x448 => ("STM32F07x — Cortex-M0", ADDRS_F0F3),
+        // ── STM32F1 (Cortex-M3) ──
+        0x412 => ("STM32F1 low-density (F101/102/103) — Cortex-M3", ADDRS_F1),
+        0x410 => ("STM32F1 medium-density (F101/102/103) — Cortex-M3", ADDRS_F1),
+        0x414 => ("STM32F1 high-density (F101/103) — Cortex-M3", ADDRS_F1),
+        0x418 => ("STM32F1 connectivity line (F105/107) — Cortex-M3", ADDRS_F1),
+        0x420 => ("STM32F100 medium-density value line — Cortex-M3", ADDRS_F1),
+        0x428 => ("STM32F100 high-density value line — Cortex-M3", ADDRS_F1),
+        0x430 => ("STM32F1 XL-density (F101/103) — Cortex-M3", ADDRS_F1),
+        // ── STM32F2 (Cortex-M3) ──
+        0x411 => ("STM32F2 — Cortex-M3", ADDRS_F2F4),
+        // ── STM32F3 (Cortex-M4F) ──
+        0x422 => ("STM32F302xB/C / F303xB/C / F358 — Cortex-M4F", ADDRS_F0F3),
+        0x432 => ("STM32F373 / F378 — Cortex-M4F", ADDRS_F0F3),
+        0x438 => ("STM32F303x4/6/8 / F334 / F328 — Cortex-M4F", ADDRS_F0F3),
+        0x439 => ("STM32F301 / F302x6/8 / F318 — Cortex-M4F", ADDRS_F0F3),
+        0x446 => ("STM32F302xD/E / F303xD/E / F398 — Cortex-M4F", ADDRS_F0F3),
+        // ── STM32F4 (Cortex-M4F) ──
+        0x413 => ("STM32F405/407/415/417 — Cortex-M4F", ADDRS_F2F4),
+        0x419 => ("STM32F42x/43x — Cortex-M4F", ADDRS_F2F4),
+        0x423 => ("STM32F401xB/C — Cortex-M4F", ADDRS_F2F4),
+        0x431 => ("STM32F411 — Cortex-M4F", ADDRS_F2F4),
+        0x433 => ("STM32F401xD/E — Cortex-M4F", ADDRS_F2F4),
+        0x441 => ("STM32F412 — Cortex-M4F", ADDRS_F2F4),
+        0x421 => ("STM32F446 — Cortex-M4F", ADDRS_F2F4),
+        0x434 => ("STM32F469/479 — Cortex-M4F", ADDRS_F2F4),
+        0x458 => ("STM32F410 — Cortex-M4F", ADDRS_F2F4),
+        0x463 => ("STM32F413/423 — Cortex-M4F", ADDRS_F2F4),
+        // ── STM32F7 (Cortex-M7) ──
+        0x449 => ("STM32F74x/75x — Cortex-M7", ADDRS_F7),
+        0x451 => ("STM32F76x/77x — Cortex-M7", ADDRS_F7),
+        0x452 => ("STM32F72x/73x — Cortex-M7", ADDRS_F7),
+        _ => return None,
+    };
+    Some(StmFamily { name, flash_size_addr, uid_addr, rdp_addr, rdp_kind })
+}
+
+/// What the ST-Link debug interface's WinUSB binding looks like on Windows.
+enum StlinkDriver {
+    /// Bound to WinUSB — pyocd/libusb can open it. (A stale/broken WinUSB bind
+    /// still reports as this; only a runtime probe failure exposes that case.)
+    WinUsb,
+    /// Present but bound to some other service (e.g. `usbccgp` / a vendor
+    /// driver / nothing) — pyocd cannot open it until it's switched to WinUSB.
+    Other(String),
+}
+
+/// Check which driver the ST-Link *debug* interface is bound to. pyocd/libusb
+/// can only open it when it's WinUSB (installed via Zadig — `--install zadig`);
+/// a wrong/missing driver makes every SWD read fail with a misleading
+/// "No device connected", so we look *before* probing and tell the user how to
+/// fix it. Returns `None` when the binding can't be determined (then we probe
+/// anyway rather than block on a guess). Windows-only — pyocd uses libusb/udev
+/// elsewhere, so there is nothing to check.
+#[cfg(windows)]
+fn stlink_driver_check(pid: u16) -> Option<StlinkDriver> {
+    // Match the debug interface: MI_00 on the composite V2-1/V3. Fall back to
+    // the bare device (no MI_xx) only for the single-interface V2 — otherwise
+    // the composite *parent* (also has no MI_, service `usbccgp`) gets picked
+    // and we'd misreport the debug interface as not-WinUSB.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue';\
+         $all = Get-PnpDevice -PresentOnly | Where-Object {{ $_.InstanceId -match 'VID_0483&PID_{pid:04X}' }};\
+         $d = $all | Where-Object {{ $_.InstanceId -match '&MI_00' }} | Select-Object -First 1;\
+         if (-not $d) {{ $d = $all | Where-Object {{ $_.InstanceId -notmatch '&MI_' }} | Select-Object -First 1 }};\
+         if ($d) {{\
+           $svc=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_Service').Data;\
+           $node=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_DevNodeStatus').Data;\
+           $problem=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode').Data;\
+           $filters=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_UpperFilters').Data -join ',';\
+           $inf=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_DriverInfPath').Data;\
+           $provider=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_DriverProvider').Data;\
+           $version=(Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_DriverVersion').Data;\
+           Write-Output \"SERVICE=$svc\"; Write-Output \"DEVNODE=$node\"; Write-Output \"PROBLEM=$problem\"; Write-Output \"FILTERS=$filters\";\
+           Write-Output \"INF=$inf\"; Write-Output \"PROVIDER=$provider\"; Write-Output \"VERSION=$version\"\
+         }}"
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let svc = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("SERVICE="))?
+        .trim()
+        .to_string();
+    let started = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("DEVNODE="))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|flags| flags & 0x8 != 0)
+        .unwrap_or(true);
+    let problem = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("PROBLEM="))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let field = |name: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(name))
+            .unwrap_or("?")
+            .trim()
+    };
+    if svc.is_empty() {
+        return Some(StlinkDriver::Other(format!(
+            "no function driver is bound (problem code {problem}); INF {}, provider {}, version {}",
+            value_or_dash(field("INF=")),
+            value_or_dash(field("PROVIDER=")),
+            value_or_dash(field("VERSION="))
+        )));
+    }
+    Some(if svc.eq_ignore_ascii_case("WinUSB") && started {
+        StlinkDriver::WinUsb
+    } else if svc.eq_ignore_ascii_case("WinUSB") {
+        let filters = field("FILTERS=");
+        let conflict = if filters.is_empty() {
+            String::new()
+        } else {
+            format!("; conflicting upper filter(s): {filters}")
+        };
+        StlinkDriver::Other(format!(
+            "WinUSB device node stopped (problem code {problem}){conflict}; INF {}, provider {}, version {}",
+            field("INF="),
+            field("PROVIDER="),
+            field("VERSION=")
+        ))
+    } else {
+        StlinkDriver::Other(svc)
+    })
+}
+
+#[cfg(not(windows))]
+fn stlink_driver_check(_pid: u16) -> Option<StlinkDriver> {
+    None
+}
+
+/// Layer-2 probe: read the downstream SWD target's identity natively (read-only,
+/// via `nusb` — no probe-rs/pyocd, no halt/reset). Returns a `HashMap` keyed for
+/// `print_stlink_target_info`. Auto-detects whether a target is present: with no
+/// SWD response only the probe-level keys are returned (one-layer result).
+fn run_stlink_target_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    let mut info = HashMap::new();
+
+    let probe = nusb::list_devices()
+        .wait()
+        .ok()
+        .and_then(|mut it| it.find(|d| d.vendor_id() == vid && d.product_id() == pid));
+    let Some(probe) = probe else {
+        info.insert("Layer 2".into(), "SKIP - ST-Link USB device not found".into());
+        return Ok(info);
+    };
+
+    let mut link = match StlinkLink::open_device(&probe) {
+        Ok(l) => l,
+        Err(e) => {
+            info.insert("Layer 2".into(), format!("SKIP - cannot open debug interface: {e}"));
+            #[cfg(windows)]
+            info.insert(
+                "Fix".into(),
+                "bind WinUSB to MI_00: usbipd-rs --install-driver --confirm (Administrator)".into(),
+            );
+            return Ok(info);
+        }
+    };
+
+    if let Ok(v) = link.get_version() {
+        let volt = link
+            .get_voltage_mv()
+            .map(|mv| format!(", target {:.2} V", mv as f64 / 1000.0))
+            .unwrap_or_default();
+        info.insert("Probe".into(), format!("{v}{volt}"));
+    }
+
+    let status = link.enter_swd().unwrap_or(0);
+    match link.read_idcode() {
+        Ok(dpidr) => {
+            info.insert("DP IDCODE".into(), format!("0x{dpidr:08X}"));
+        }
+        Err(_) => {
+            info.insert(
+                "Layer 2".into(),
+                format!("none - ST-Link present, no SWD/JTAG target on the debug header (enter-SWD status 0x{status:02X})"),
+            );
+            return Ok(info);
+        }
+    }
+
+    let db = load_chip_db();
+    let (regs, dev_id, resolved) = stlink_read_regs(&mut link, &db);
+    for (k, v) in format_target_rows(&regs, dev_id, resolved.as_ref()) {
+        info.insert(k.to_string(), v);
+    }
+    Ok(info)
+}
+
+// ============================================================================
+// Optional external chip database (stlink-style `etc/chips/*.chip` files)
+//
+// The built-in `stm_family` table is the always-available base library. A
+// `.chip` file lets a user add or override a model WITHOUT recompiling: a model
+// with a matching `.chip` takes priority; otherwise the built-in table is used.
+// The format is a subset of stlink-org/stlink's, so real stlink chip files drop
+// in unmodified (unknown keys are ignored).
+// ============================================================================
+
+/// A chip definition parsed from a `.chip` file. Only the fields this tool uses
+/// are kept.
+struct ChipDef {
+    dev_id: u16,
+    name: String,
+    flash_size_addr: Option<u32>,
+    sram_kb: Option<u32>,
+    source: String,
+}
+
+/// Parse a C-style integer as written in `.chip` files: `0x...` hex or decimal.
+fn parse_chip_int(s: &str) -> Option<u32> {
+    let s = s.trim().trim_end_matches([',', ';']);
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+/// Parse one `.chip` file's text. Returns `None` if it has no `chip_id`.
+fn parse_chip_file(text: &str) -> Option<ChipDef> {
+    let mut dev_id = None;
+    let mut name = None;
+    let mut flash_size_addr = None;
+    let mut sram_bytes = None;
+    for raw in text.lines() {
+        // Strip `// ...` and `# ...` comments, then split key/value.
+        let line = raw.split("//").next().unwrap_or(raw);
+        let line = line.split('#').next().unwrap_or(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (key, val) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+        match key {
+            "chip_id" => dev_id = parse_chip_int(val).map(|v| v as u16),
+            "dev_type" => name = Some(val.replace('_', " ")),
+            "flash_size_reg" => flash_size_addr = parse_chip_int(val),
+            "sram_size" => sram_bytes = parse_chip_int(val),
+            _ => {}
+        }
+    }
+    let dev_id = dev_id?;
+    Some(ChipDef {
+        dev_id,
+        name: name.unwrap_or_else(|| format!("STM32 (chip_id 0x{dev_id:03X})")),
+        flash_size_addr,
+        sram_kb: sram_bytes.map(|b| b / 1024),
+        source: String::new(),
+    })
+}
+
+/// Directories searched for `.chip` files: `etc/chips/` relative to the working
+/// directory (running from a checkout) and `etc/chips` / `chips` next to the
+/// executable (running a packaged binary).
+fn chip_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("etc/chips")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("etc/chips"));
+            dirs.push(dir.join("chips"));
+        }
+    }
+    dirs
+}
+
+/// Load every readable `.chip` file from the search directories.
+fn load_chip_db() -> Vec<ChipDef> {
+    let mut defs = Vec::new();
+    for dir in chip_search_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("chip") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Some(mut def) = parse_chip_file(&text) {
+                    def.source = path.display().to_string();
+                    defs.push(def);
+                }
+            }
+        }
+    }
+    defs
+}
+
+/// Resolved chip parameters used by the native reader: `.chip` overrides the
+/// built-in name / flash address / SRAM; the (verified) UID and RDP register
+/// addresses always come from the built-in family table.
+struct ResolvedChip {
+    name: String,
+    flash_size_addr: Option<u32>,
+    uid_addr: Option<u32>,
+    rdp_addr: Option<u32>,
+    rdp_kind: Option<RdpKind>,
+    sram_kb: Option<u32>,
+    source: String,
+}
+
+/// Authoritative main-SRAM sizes (KB) for built-in families, taken from the
+/// stlink chip database. Used when no `.chip` file supplies one.
+fn builtin_sram_kb(dev_id: u16) -> Option<u32> {
+    Some(match dev_id {
+        0x412 => 10,
+        0x410 => 20,
+        0x414 | 0x418 => 64,
+        0x411 => 128,
+        0x423 => 64,
+        0x433 => 96,
+        0x413 => 192,
+        0x419 => 256,
+        0x431 | 0x421 => 128,
+        0x441 => 256,
+        0x449 => 320,
+        0x451 => 512,
+        0x452 => 256,
+        _ => return None,
+    })
+}
+
+/// Resolve a DBGMCU DEV_ID into chip parameters, preferring a matching `.chip`
+/// file over the built-in table. Returns `None` if neither knows the model.
+fn resolve_chip(dev_id: u16, db: &[ChipDef]) -> Option<ResolvedChip> {
+    let builtin = stm_family(dev_id);
+    match db.iter().find(|c| c.dev_id == dev_id) {
+        Some(chip) => Some(ResolvedChip {
+            name: chip.name.clone(),
+            flash_size_addr: chip.flash_size_addr.or(builtin.map(|f| f.flash_size_addr)),
+            uid_addr: builtin.map(|f| f.uid_addr),
+            rdp_addr: builtin.map(|f| f.rdp_addr),
+            rdp_kind: builtin.map(|f| f.rdp_kind),
+            sram_kb: chip.sram_kb.or_else(|| builtin_sram_kb(dev_id)),
+            source: chip.source.clone(),
+        }),
+        None => builtin.map(|f| ResolvedChip {
+            name: f.name.to_string(),
+            flash_size_addr: Some(f.flash_size_addr),
+            uid_addr: Some(f.uid_addr),
+            rdp_addr: Some(f.rdp_addr),
+            rdp_kind: Some(f.rdp_kind),
+            sram_kb: builtin_sram_kb(dev_id),
+            source: "built-in".to_string(),
+        }),
+    }
+}
+
+/// Decode an Arm Cortex-M `CPUID` (0xE000ED00) into a "core rNpM (CPUID …)"
+/// string. Used by both the pyocd-backed and native SWD paths.
+fn cortex_core(cpuid: u32) -> String {
+    let partno = (cpuid >> 4) & 0xFFF;
+    let variant = (cpuid >> 20) & 0xF;
+    let revision = cpuid & 0xF;
+    let core = match partno {
+        0xC20 => "Cortex-M0",
+        0xC60 => "Cortex-M0+",
+        0xC21 => "Cortex-M1",
+        0xC23 => "Cortex-M3",
+        0xC24 => "Cortex-M4",
+        0xC27 => "Cortex-M7",
+        0xD20 => "Cortex-M23",
+        0xD21 => "Cortex-M33",
+        _ => "Cortex-M (unknown)",
+    };
+    format!("{core} r{variant}p{revision} (CPUID 0x{cpuid:08X})")
+}
+
+/// Decode a flash read-protection register value into a human description.
+fn decode_rdp(opt: u32, kind: RdpKind) -> String {
+    match kind {
+        RdpKind::Obr => {
+            let mut s = if (opt >> 1) & 1 == 1 {
+                "Enabled — flash read-protected (RDP active)".to_string()
+            } else {
+                "Disabled — flash readable (RDP Level 0)".to_string()
+            };
+            if opt & 1 == 1 {
+                s.push_str(", OPTERR set");
+            }
+            s
+        }
+        RdpKind::OptByte => {
+            let rdp = (opt >> 8) & 0xFF;
+            match rdp {
+                0xAA => "Disabled — flash readable (RDP Level 0)".to_string(),
+                0xCC => "Enabled — RDP Level 2 (permanent, debug locked)".to_string(),
+                _ => format!("Enabled — RDP Level 1 (RDP byte 0x{rdp:02X})"),
+            }
+        }
+    }
+}
+
+fn decode_stlink_regs(regs: &HashMap<u32, Vec<u32>>, dev_id: Option<u16>) -> HashMap<String, String> {
+    let mut info = HashMap::new();
+    let first = |addr: u32| regs.get(&addr).and_then(|w| w.first()).copied();
+
+    // ── Core (CPUID is universal across ARMv6-M/ARMv7-M) ──
+    if let Some(cpuid) = first(0xE000ED00) {
+        info.insert("Core".to_string(), cortex_core(cpuid));
+    }
+
+    let fam = dev_id.and_then(stm_family);
+    if dev_id == Some(0x421) {
+        info.insert(
+            "Architecture".to_string(),
+            "Armv7E-M, Thumb-2, DSP, single-precision FPU".to_string(),
+        );
+        info.insert("Max clock".to_string(), "180 MHz".to_string());
+        info.insert("SRAM".to_string(), "128 KB".to_string());
+        info.insert(
+            "Identification".to_string(),
+            "DBGMCU DEV_ID identifies STM32F446 family; package suffix not readable over SWD"
+                .to_string(),
+        );
+    }
+    info.insert("Access".to_string(), "Read-only identity registers".to_string());
+    info.insert("Transport".to_string(), "SWD at 100 kHz".to_string());
+
+    // ── Device ID + revision ──
+    if let Some(idcode) = first(0xE0042000) {
+        let did = idcode & 0xFFF;
+        let rev_id = (idcode >> 16) & 0xFFFF;
+        let name = fam.map(|f| f.name).unwrap_or("unknown (unrecognized STM32 DEV_ID)");
+        info.insert("Device ID".to_string(), format!("0x{did:03X} — {name}"));
+        // REV_ID → silicon-revision letter is only well-defined per device;
+        // this map covers the 0x410 medium-density part (F103C8 / "Blue Pill").
+        let rev = if did == 0x410 {
+            match rev_id {
+                0x0000 => " (rev A)",
+                0x2000 => " (rev B)",
+                0x2001 => " (rev Z)",
+                0x2003 => " (rev 1/2/3/X/Y)",
+                _ => "",
+            }
+        } else {
+            ""
+        };
+        info.insert("Revision".to_string(), format!("0x{rev_id:04X}{rev}"));
+    }
+
+    // ── Flash size / UID / RDP — only readable once we know the family ──
+    if let Some(fam) = fam {
+        if let Some(words) = regs.get(&fam.flash_size_addr) {
+            let kb = words[0] & 0xFFFF;
+            // 0x0000 / 0xFFFF mean the field is unprogrammed or unreadable.
+            if kb != 0 && kb != 0xFFFF {
+                info.insert("Flash size".to_string(), format!("{kb} KB"));
+                info.insert(
+                    "Flash map".to_string(),
+                    format!("0x08000000-0x{:08X}", 0x08000000u32 + kb * 1024 - 1),
+                );
+            }
+        }
+
+        if let Some(w) = regs.get(&fam.uid_addr) {
+            // All-0xFF means the read faulted (wrong address / locked), not a
+            // real UID — skip it rather than print a bogus serial.
+            let blank = w.iter().take(3).all(|&x| x == 0xFFFFFFFF);
+            if w.len() >= 3 && !blank {
+                // 96-bit UID, printed most-significant word first.
+                info.insert(
+                    "Unique ID".to_string(),
+                    format!("{:08X} {:08X} {:08X}", w[2], w[1], w[0]),
+                );
+            }
+        }
+
+        if let Some(opt) = first(fam.rdp_addr) {
+            info.insert("Read protection".to_string(), decode_rdp(opt, fam.rdp_kind));
+        }
+    }
+
+    info
+}
+
+fn print_stlink_target_info(info: &HashMap<String, String>, board: &str) {
+    // Probe-level keys (always present once the debug interface opens).
+    for key in ["Probe", "DP IDCODE"] {
+        if let Some(value) = info.get(key) {
+            println!("  {:<16} {value}", format!("{key}:"));
+        }
+    }
+
+    // No downstream target: one-layer result. Show the reason and stop.
+    if !info.contains_key("Device ID") {
+        if let Some(state) = info.get("Layer 2") {
+            println!("  Layer 2:         {state}");
+        } else {
+            println!("  Layer 2:         none - no SWD/JTAG target detected");
+        }
+        if let Some(fix) = info.get("Fix") {
+            println!("  Fix:             {fix}");
+        }
+        return;
+    }
+
+    // Two-layer result: a target answered. Print its read-only identity.
+    println!("  Layer 2 - downstream SWD target (read-only) via {board}:");
+    for key in [
+        "Device ID", "Revision", "Core", "Architecture", "Max clock", "Flash size",
+        "Flash map", "SRAM", "Unique ID", "Read protection", "Transport", "Access", "Source",
+    ] {
+        if let Some(v) = info.get(key) {
+            println!("    {:<16} {v}", format!("{key}:"));
+        }
+    }
+}
+
 fn microbit_identify(unique_id: &str) -> Option<(&'static str, &'static str)> {
     // First 4 hex digits of the Unique ID identify the board hardware revision
     // (this prefix is assigned by Microbit Foundation / DAPLink board database).
@@ -1515,7 +2449,7 @@ fn avr_chip_summary(mcu: &str) -> &'static str {
     }
 }
 
-fn print_table(rows: &[[String; 5]]) {
+fn print_table(rows: &[[String; 4]]) {
     let mut widths = HEADERS.map(UnicodeWidthStr::width);
     for r in rows {
         for (i, cell) in r.iter().enumerate() {
@@ -1523,7 +2457,7 @@ fn print_table(rows: &[[String; 5]]) {
         }
     }
 
-    let render = |cells: &[&str; 5]| -> String {
+    let render = |cells: &[&str; 4]| -> String {
         let mut out = String::new();
         for (i, cell) in cells.iter().enumerate() {
             out.push_str(&pad_display(cell, widths[i]));
@@ -1540,7 +2474,7 @@ fn print_table(rows: &[[String; 5]]) {
     println!("{}", "-".repeat(total));
 
     for r in rows {
-        let cells: [&str; 5] = [&r[0], &r[1], &r[2], &r[3], &r[4]];
+        let cells: [&str; 4] = [&r[0], &r[1], &r[2], &r[3]];
         println!("{}", render(&cells));
     }
 }
@@ -1564,7 +2498,6 @@ struct Entry {
     busid: String,
     vidpid: String,
     device: String,
-    state: String,
 }
 
 impl Entry {
@@ -1584,30 +2517,78 @@ impl Entry {
 
 fn nusb_by_vidpid() -> HashMap<(u16, u16), nusb::DeviceInfo> {
     nusb::list_devices()
+        .wait()
         .map(|it| it.map(|d| ((d.vendor_id(), d.product_id()), d)).collect())
         .unwrap_or_default()
 }
 
-/// Pick a USB enumeration source for the host OS. Windows has the usbip
-/// share/attach model, so we parse `usbipd.exe list` to surface its STATE
-/// column; everywhere else there's no such daemon, so enumerate directly via
-/// the cross-platform `nusb` crate.
+/// Enumerate USB devices directly through the cross-platform `nusb` crate.
+/// Listing local hardware must not depend on the optional usbipd-win service
+/// or CLI.
 fn list_entries() -> Result<Vec<Entry>> {
-    if current_os() == Os::Windows {
-        run_usbipd_list()
-    } else {
-        Ok(nusb_entries())
+    Ok(nusb_entries())
+}
+
+fn nusb_bus_numbers() -> HashMap<String, u8> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut ids: Vec<String> = nusb::list_buses()
+            .wait()
+            .map(|buses| buses.map(|bus| bus.bus_id().to_string()).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        return ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index as u8))
+            .collect();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        HashMap::new()
     }
 }
 
-/// Build the listing rows straight from `nusb` (macOS / Linux). There's no
-/// usbip BUSID or share state off Windows, so synthesize a stable `bus-address`
-/// id and leave STATE blank. Sorted by (bus, address) for deterministic output.
+fn nusb_bus_number(device: &nusb::DeviceInfo, _windows_buses: &HashMap<String, u8>) -> u8 {
+    #[cfg(target_os = "windows")]
+    {
+        return _windows_buses.get(device.bus_id()).copied().unwrap_or(0);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return u8::from_str_radix(device.bus_id(), 16).unwrap_or(0);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        device.bus_id().parse::<u8>().unwrap_or(0)
+    }
+}
+
+fn nusb_busid(device: &nusb::DeviceInfo, windows_buses: &HashMap<String, u8>) -> String {
+    let bus = nusb_bus_number(device, windows_buses);
+    let ports = device.port_chain();
+    if ports.is_empty() {
+        format!("{bus}-{}", device.device_address())
+    } else {
+        let path = ports
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("{bus}-{path}")
+    }
+}
+
+/// Build listing rows straight from `nusb`, sorted by bus and physical port
+/// chain for deterministic, topology-based output.
 fn nusb_entries() -> Vec<Entry> {
+    let bus_numbers = nusb_bus_numbers();
     let mut devs: Vec<nusb::DeviceInfo> = nusb::list_devices()
+        .wait()
         .map(|it| it.collect())
         .unwrap_or_default();
-    devs.sort_by_key(|d| (d.bus_number(), d.device_address()));
+    devs.sort_by_key(|d| (nusb_bus_number(d, &bus_numbers), d.port_chain().to_vec()));
     devs.iter()
         .map(|d| {
             let device = match (d.manufacturer_string(), d.product_string()) {
@@ -1617,84 +2598,1041 @@ fn nusb_entries() -> Vec<Entry> {
                 (None, None) => "(unknown device)".to_string(),
             };
             Entry {
-                busid: format!("{}-{}", d.bus_number(), d.device_address()),
+                busid: nusb_busid(d, &bus_numbers),
                 vidpid: format!("{:04x}:{:04x}", d.vendor_id(), d.product_id()),
                 device,
-                state: String::new(),
             }
         })
         .collect()
 }
 
-fn run_usbipd_list() -> Result<Vec<Entry>> {
-    let output = Command::new("usbipd.exe")
-        .arg("list")
-        .output()
-        .context("Failed to invoke usbipd. Install usbipd-win and ensure it's on PATH.")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "usbipd list failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(parse_usbipd(&String::from_utf8_lossy(&output.stdout)))
+#[derive(Default)]
+struct WindowsUsbDriverNode {
+    status: String,
+    class: String,
+    name: String,
+    instance_id: String,
+    service: String,
+    problem: String,
+    inf: String,
+    provider: String,
+    version: String,
 }
 
-fn parse_usbipd(s: &str) -> Vec<Entry> {
-    let mut out = Vec::new();
-    let mut in_connected = false;
-    let states = [
-        "Attached - Shared",
-        "Attached",
-        "Not shared",
-        "Shared",
-    ];
+impl WindowsUsbDriverNode {
+    fn is_healthy(&self) -> bool {
+        self.status.eq_ignore_ascii_case("OK")
+            && (self.problem.is_empty() || self.problem == "0" || self.problem == "CM_PROB_NONE")
+    }
 
-    for line in s.lines() {
-        let trimmed = line.trim();
-        if trimmed == "Connected:" {
-            in_connected = true;
+    fn set_field(&mut self, key: &str, value: &str) {
+        let target = match key {
+            "STATUS" => &mut self.status,
+            "CLASS" => &mut self.class,
+            "NAME" => &mut self.name,
+            "INSTANCE" => &mut self.instance_id,
+            "SERVICE" => &mut self.service,
+            "PROBLEM" => &mut self.problem,
+            "INF" => &mut self.inf,
+            "PROVIDER" => &mut self.provider,
+            "VERSION" => &mut self.version,
+            _ => return,
+        };
+        *target = value.trim().to_string();
+    }
+}
+
+#[cfg(windows)]
+fn windows_usb_driver_nodes() -> Result<Vec<WindowsUsbDriverNode>> {
+    let script = r#"
+$ErrorActionPreference='SilentlyContinue'
+function Prop($d, $key) {
+  $p = Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName $key
+  if ($null -ne $p.Data) { return ($p.Data -join ',') }
+  return ''
+}
+Get-PnpDevice -PresentOnly |
+  Where-Object { $_.InstanceId -like 'USB\VID_*' } |
+  Sort-Object InstanceId |
+  ForEach-Object {
+    Write-Output '@@NODE@@'
+    Write-Output ('STATUS=' + $_.Status)
+    Write-Output ('CLASS=' + $_.Class)
+    Write-Output ('NAME=' + $_.FriendlyName)
+    Write-Output ('INSTANCE=' + $_.InstanceId)
+    Write-Output ('SERVICE=' + (Prop $_ 'DEVPKEY_Device_Service'))
+    Write-Output ('PROBLEM=' + (Prop $_ 'DEVPKEY_Device_ProblemCode'))
+    Write-Output ('INF=' + (Prop $_ 'DEVPKEY_Device_DriverInfPath'))
+    Write-Output ('PROVIDER=' + (Prop $_ 'DEVPKEY_Device_DriverProvider'))
+    Write-Output ('VERSION=' + (Prop $_ 'DEVPKEY_Device_DriverVersion'))
+  }
+"#;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .context("failed to query Windows Plug and Play devices")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Windows Plug and Play query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut nodes = Vec::new();
+    let mut current: Option<WindowsUsbDriverNode> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line == "@@NODE@@" {
+            if let Some(node) = current.take() {
+                nodes.push(node);
+            }
+            current = Some(WindowsUsbDriverNode::default());
+        } else if let Some((key, value)) = line.split_once('=') {
+            if let Some(node) = current.as_mut() {
+                node.set_field(key, value);
+            }
+        }
+    }
+    if let Some(node) = current {
+        nodes.push(node);
+    }
+    Ok(nodes)
+}
+
+#[cfg(not(windows))]
+fn windows_usb_driver_nodes() -> Result<Vec<WindowsUsbDriverNode>> {
+    Ok(Vec::new())
+}
+
+/// Recommended official driver for an unhealthy interface, plus — when this
+/// repository ships the matching package — the relative path to the bundled
+/// INF so `--driver-status` can report "available locally" instead of blindly
+/// telling the user to download.
+struct DriverAdvice {
+    name: &'static str,
+    install: &'static str,
+    /// Relative path (from the repo root / exe dir) to a bundled INF, if any.
+    local_inf: Option<&'static str>,
+}
+
+fn known_driver_advice(instance_id: &str) -> Option<DriverAdvice> {
+    let id = instance_id.to_ascii_uppercase();
+    if id.contains("VID_0483&PID_374B&MI_00")
+        || id.contains("VID_0483&PID_374A&MI_00")
+        || id.contains("VID_0483&PID_374E&MI_00")
+        || id.contains("VID_0483&PID_374F&MI_00")
+    {
+        return Some(DriverAdvice {
+            name: "STMicroelectronics STSW-LINK009 (WinUSB binding for ST-Link Debug)",
+            install: r#"pnputil /add-driver ".\windows-driver\stsw-link009\stlink_dbg_winusb.inf" /install"#,
+            local_inf: Some("windows-driver/stsw-link009/stlink_dbg_winusb.inf"),
+        });
+    }
+    if id.contains("VID_0483&PID_DF11") {
+        return Some(DriverAdvice {
+            name: "STM32CubeProgrammer driver package or WinUSB",
+            install: "Install STM32CubeProgrammer, or bind this DFU interface to WinUSB with Zadig.",
+            local_inf: None,
+        });
+    }
+    if id.contains("VID_10C4&PID_EA") {
+        return Some(DriverAdvice {
+            name: "Silicon Labs CP210x Universal Windows Driver",
+            install: "Download from https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers",
+            local_inf: None,
+        });
+    }
+    if id.contains("VID_1A86&") {
+        return Some(DriverAdvice {
+            name: "WCH CH34x/CH91xx Windows driver",
+            install: "Download from https://www.wch-ic.com/downloads/CH341SER_EXE.html",
+            local_inf: None,
+        });
+    }
+    if id.contains("VID_0403&") {
+        return Some(DriverAdvice {
+            name: "FTDI CDM/VCP driver",
+            install: "Download from https://ftdichip.com/drivers/vcp-drivers/",
+            local_inf: None,
+        });
+    }
+    if id.contains("VID_2E8A&PID_0003") || id.contains("VID_2E8A&PID_000F") {
+        return Some(DriverAdvice {
+            name: "Microsoft WinUSB for Raspberry Pi BOOTSEL",
+            install: "Use Zadig to bind only the RP2 BOOTSEL interface to WinUSB.",
+            local_inf: None,
+        });
+    }
+    None
+}
+
+/// Print whether the recommended driver is already on hand — bundled in this
+/// repo and/or staged in the Windows driver store — so the user knows they can
+/// install offline instead of downloading.
+fn report_local_driver_availability(advice: &DriverAdvice) {
+    let Some(rel) = advice.local_inf else { return };
+    match find_local_inf(rel) {
+        Some(path) => println!("  Local INF: AVAILABLE - {} (no download needed)", path.display()),
+        None => println!("  Local INF: not bundled at {rel}; download required"),
+    }
+    #[cfg(windows)]
+    if let Some(original) = Path::new(rel).file_name().and_then(|n| n.to_str()) {
+        let staged = driverstore_matches(original);
+        if staged.is_empty() {
+            println!("  Driver store: no package staged from {original} yet");
+        } else {
+            println!("  Driver store: already staged as {}", staged.join(", "));
+        }
+    }
+}
+
+/// Look for a bundled INF on disk: first relative to the current working
+/// directory (running from the repo), then next to the executable (running an
+/// installed/copied binary). Returns the first path that exists.
+fn find_local_inf(rel: &str) -> Option<PathBuf> {
+    let cwd = PathBuf::from(rel);
+    if cwd.is_file() {
+        return Some(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Published `oemNN.inf` names in the Windows driver store whose package was
+/// staged from `original_inf` (e.g. `stlink_dbg_winusb.inf`). Parses
+/// `pnputil /enum-drivers` locale-independently: it splits the output into
+/// per-driver blocks and, for any block mentioning the original file name,
+/// extracts the `oemNN.inf` token (which Windows assigns regardless of UI
+/// language). An empty result means the package is not yet staged.
+#[cfg(windows)]
+fn driverstore_matches(original_inf: &str) -> Vec<String> {
+    let output = match Command::new("pnputil").args(["/enum-drivers"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    parse_driverstore_oem(&String::from_utf8_lossy(&output.stdout), original_inf)
+}
+
+/// Pure parser for `pnputil /enum-drivers` output: returns the `oemNN.inf`
+/// published names of every driver block that mentions `original_inf`. Split
+/// out from `driverstore_matches` so it is testable on any OS and independent
+/// of the locale-specific field labels Windows prints.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_driverstore_oem(text: &str, original_inf: &str) -> Vec<String> {
+    let target = original_inf.to_ascii_lowercase();
+    let mut matches = Vec::new();
+    for block in text.split("\r\n\r\n").flat_map(|b| b.split("\n\n")) {
+        if !block.to_ascii_lowercase().contains(&target) {
             continue;
         }
-        if trimmed == "Persisted:" {
-            in_connected = false;
-            continue;
+        if let Some(oem) = block.split_whitespace().find(|token| {
+            let t = token.trim_end_matches([',', ';']).to_ascii_lowercase();
+            t.starts_with("oem") && t.ends_with(".inf")
+        }) {
+            let oem = oem.trim_end_matches([',', ';']).to_string();
+            if !matches.contains(&oem) {
+                matches.push(oem);
+            }
         }
-        if !in_connected
-            || trimmed.is_empty()
-            || trimmed.starts_with("BUSID")
-            || trimmed.starts_with("GUID")
-        {
+    }
+    matches
+}
+
+fn instance_vidpid(instance_id: &str) -> Option<(u16, u16)> {
+    let id = instance_id.to_ascii_uppercase();
+    let vid = id.split("VID_").nth(1)?.get(..4)?;
+    let pid = id.split("PID_").nth(1)?.get(..4)?;
+    Some((
+        u16::from_str_radix(vid, 16).ok()?,
+        u16::from_str_radix(pid, 16).ok()?,
+    ))
+}
+
+fn cmd_driver_status() -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        println!("--driver-status currently reports Windows Plug and Play driver bindings only.");
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let devices: Vec<nusb::DeviceInfo> = nusb::list_devices()
+            .wait()
+            .context("failed to enumerate USB hardware through nusb")?
+            .collect();
+        let nodes = windows_usb_driver_nodes()?;
+
+        println!("=== USB Hardware Evidence ===");
+        println!("PASS - Windows USB hub enumeration returned {} physical USB device(s).", devices.len());
+        println!("This proves USB signaling/enumeration works; it does not prove every function driver works.");
+
+        println!("\n=== Windows USB Interface Drivers ===");
+        let mut failures = 0usize;
+        for node in &nodes {
+            let health = if node.is_healthy() { "OK" } else { failures += 1; "NEEDS ATTENTION" };
+            println!("\n[{health}] {}", if node.name.is_empty() { "(unnamed USB interface)" } else { &node.name });
+            println!("  Instance: {}", node.instance_id);
+            println!("  Class/service: {}/{}", value_or_dash(&node.class), value_or_dash(&node.service));
+            println!("  Driver: {} / {} / {}", value_or_dash(&node.provider), value_or_dash(&node.inf), value_or_dash(&node.version));
+            println!("  PnP status/problem: {} / {}", value_or_dash(&node.status), value_or_dash(&node.problem));
+            if !node.is_healthy() {
+                if let Some(issue) = classify_driver_issue(node) {
+                    println!("  Classification: {} - {}", issue.label(), issue.meaning());
+                    println!("  Safe next action: {}", issue.next_action());
+                }
+                if let Some((vid, pid)) = instance_vidpid(&node.instance_id) {
+                    if let Some(device) = devices
+                        .iter()
+                        .find(|device| device.vendor_id() == vid && device.product_id() == pid)
+                    {
+                        println!(
+                            "  Hardware evidence: PASS - nusb sees {:04x}:{:04x}, product {:?}, serial {:?}, speed {:?}",
+                            vid,
+                            pid,
+                            device.product_string(),
+                            device.serial_number(),
+                            device.speed()
+                        );
+                        let interfaces = device
+                            .interfaces()
+                            .map(|interface| {
+                                format!(
+                                    "MI_{:02} class {:02x}",
+                                    interface.interface_number(),
+                                    interface.class()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("  Descriptor interfaces: {interfaces}");
+                    }
+                }
+                if let Some(advice) = known_driver_advice(&node.instance_id) {
+                    println!("  Known official driver: {}", advice.name);
+                    println!("  Install: {}", advice.install);
+                    report_local_driver_availability(&advice);
+                } else {
+                    println!("  Next step: search the exact VID:PID on the hardware vendor's support site or Microsoft Update Catalog.");
+                }
+            }
+        }
+
+        println!("\n=== Diagnosis ===");
+        if failures == 0 {
+            println!("All {} present USB PnP function(s) report healthy.", nodes.len());
+        } else {
+            println!("{failures} of {} present USB PnP function(s) need attention.", nodes.len());
+            println!("A device listed under Hardware Evidence but failing here is primarily a Windows driver/binding problem, not proof of faulty hardware.");
+            println!("This still cannot prove that every downstream MCU, sensor, or external circuit behind the USB controller is healthy.");
+        }
+        Ok(())
+    }
+}
+
+/// `--install-driver`: dry-run by default, executing only with `--confirm`.
+/// Restricted to the ST-Link `MI_00` debug interface (the only binding this
+/// repo ships an INF for) so it can never touch the healthy Mass Storage /
+/// COM / composite functions of the same device.
+fn cmd_install_driver(confirm: bool) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = confirm;
+        println!("--install-driver binds Windows USB function drivers and runs on Windows only.");
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        println!("=== ST-Link MI_00 Driver Install ({}) ===", if confirm { "EXECUTE" } else { "DRY RUN" });
+        println!("Scope: only the ST-Link Debug MI_00 interface is touched; Mass Storage, COM, and the composite parent are left alone.\n");
+
+        let nodes = windows_usb_driver_nodes()?;
+        let candidates: Vec<&WindowsUsbDriverNode> = nodes
+            .iter()
+            .filter(|n| n.instance_id.to_ascii_uppercase().contains("&MI_00"))
+            .filter(|n| !n.is_healthy())
+            .filter(|n| known_driver_advice(&n.instance_id).is_some_and(|a| a.local_inf.is_some()))
+            .collect();
+
+        if candidates.is_empty() {
+            println!("No unhealthy MI_00 interface with a bundled INF was found.");
+            println!("Run `usbipd-rs --driver-status` to inspect current bindings.");
+            return Ok(());
+        }
+
+        let mut executed = 0usize;
+        for node in candidates {
+            let advice = known_driver_advice(&node.instance_id).expect("filtered to Some above");
+            let rel = advice.local_inf.expect("filtered to Some above");
+            let inf = match find_local_inf(rel) {
+                Some(path) => path,
+                None => {
+                    println!("[SKIP] {}", node.instance_id);
+                    println!("  Bundled INF missing at {rel}; cannot install offline.");
+                    continue;
+                }
+            };
+
+            println!("Interface that would be modified:");
+            println!("  Instance: {}", node.instance_id);
+            if let Some(issue) = classify_driver_issue(node) {
+                println!("  Current state: {} (status {}, problem {})", issue.label(), value_or_dash(&node.status), value_or_dash(&node.problem));
+            }
+            println!("  Driver package: {}", advice.name);
+            println!("  INF file: {}", inf.display());
+            let inf_arg = inf.to_string_lossy();
+            println!("  Command: pnputil /add-driver \"{inf_arg}\" /install");
+
+            if !confirm {
+                println!("  Action: none (dry run). Re-run with --confirm to apply.\n");
+                continue;
+            }
+
+            println!("  Action: running pnputil ...");
+            let output = Command::new("pnputil")
+                .args(["/add-driver", inf_arg.as_ref(), "/install"])
+                .output()
+                .context("failed to launch pnputil (driver install needs an elevated/admin shell)")?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stdout.lines().chain(stderr.lines()).map(str::trim).filter(|l| !l.is_empty()) {
+                println!("    {line}");
+            }
+            if !output.status.success() {
+                println!("  Result: FAIL - pnputil exited with {}. An Administrator shell is required.\n", output.status);
+                continue;
+            }
+            executed += 1;
+
+            // Recovery check: re-query the same instance and confirm it is now
+            // healthy *without* a reboot.
+            let after = windows_usb_driver_nodes()?;
+            match after.iter().find(|n| n.instance_id == node.instance_id) {
+                Some(n) if n.is_healthy() => {
+                    println!("  Result: PASS - {} is now {} / problem {} (recovered, no reboot).", n.instance_id, value_or_dash(&n.status), value_or_dash(&n.problem));
+                }
+                Some(n) => {
+                    println!("  Result: PARTIAL - still {} / problem {}. Unplug and replug the device, or check it reports NEED_RESTART.", value_or_dash(&n.status), value_or_dash(&n.problem));
+                }
+                None => println!("  Result: node re-enumerated under a new instance id; re-run --driver-status to confirm."),
+            }
+            println!();
+        }
+
+        if confirm {
+            println!("Installed {executed} driver binding(s). Verify with `usbipd-rs --driver-status` and `usbipd-rs --mcu-alive`.");
+        } else {
+            println!("Dry run complete. No changes were made. Re-run with --confirm in an Administrator shell to apply.");
+        }
+        Ok(())
+    }
+}
+
+fn value_or_dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
+}
+
+/// A coarse, actionable category for *why* a present USB interface is
+/// unhealthy, derived from its Windows PnP problem code, bound service, and
+/// status. The point is to separate "Windows never bound a driver" from
+/// "a driver is bound but broken" so the next step is unambiguous.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DriverIssue {
+    MissingDriver,
+    DriverLoadFailure,
+    StoppedNode,
+    SignatureFailure,
+    Blocked,
+    ResourceConflict,
+    Unknown,
+}
+
+impl DriverIssue {
+    fn label(self) -> &'static str {
+        match self {
+            DriverIssue::MissingDriver => "MISSING FUNCTION DRIVER",
+            DriverIssue::DriverLoadFailure => "DRIVER FAILED TO LOAD",
+            DriverIssue::StoppedNode => "DEVICE NODE STOPPED/DISABLED",
+            DriverIssue::SignatureFailure => "DRIVER SIGNATURE REJECTED",
+            DriverIssue::Blocked => "DRIVER BLOCKED",
+            DriverIssue::ResourceConflict => "RESOURCE CONFLICT",
+            DriverIssue::Unknown => "UNCLASSIFIED PROBLEM",
+        }
+    }
+
+    fn meaning(self) -> &'static str {
+        match self {
+            DriverIssue::MissingDriver => {
+                "Windows enumerated the interface but bound no function driver (no service)."
+            }
+            DriverIssue::DriverLoadFailure => {
+                "A driver is assigned but its service could not start: stale binding, failed driver entry, or a prior unload."
+            }
+            DriverIssue::StoppedNode => {
+                "The node is disabled, not started, or waiting for a restart."
+            }
+            DriverIssue::SignatureFailure => {
+                "The matched driver's digital signature could not be verified."
+            }
+            DriverIssue::Blocked => {
+                "Windows blocked this driver under a known-bad list or security policy."
+            }
+            DriverIssue::ResourceConflict => {
+                "The device reports an I/O, memory, or IRQ resource conflict."
+            }
+            DriverIssue::Unknown => "The problem code does not map to a known category.",
+        }
+    }
+
+    fn next_action(self) -> &'static str {
+        match self {
+            DriverIssue::MissingDriver => {
+                "Bind the correct function driver (see below). This is a driver gap, not a hardware fault."
+            }
+            DriverIssue::DriverLoadFailure => {
+                "Remove the stale binding (pnputil /delete-driver) then reinstall the correct INF."
+            }
+            DriverIssue::StoppedNode => {
+                "Enable/restart the node in Device Manager; reboot only if it reports NEED_RESTART."
+            }
+            DriverIssue::SignatureFailure => {
+                "Install a properly signed driver package from the vendor."
+            }
+            DriverIssue::Blocked => {
+                "Do not force-load. Obtain an updated, unblocked driver from the vendor."
+            }
+            DriverIssue::ResourceConflict => {
+                "Move the device to another port/hub and check for a conflicting device."
+            }
+            DriverIssue::Unknown => {
+                "Inspect the raw problem code for this instance in Device Manager."
+            }
+        }
+    }
+}
+
+/// Map an unhealthy node to a `DriverIssue`. Returns `None` when the node is
+/// healthy. The numeric values are Windows `CM_PROB_*` configuration-manager
+/// problem codes reported via `DEVPKEY_Device_ProblemCode`.
+fn classify_driver_issue(node: &WindowsUsbDriverNode) -> Option<DriverIssue> {
+    if node.is_healthy() {
+        return None;
+    }
+    let no_service = node.service.trim().is_empty();
+    let code: u32 = node.problem.trim().parse().unwrap_or(0);
+    let issue = match code {
+        // CM_PROB_NOT_CONFIGURED / CM_PROB_FAILED_INSTALL: no driver vs broken.
+        1 | 28 => {
+            if no_service {
+                DriverIssue::MissingDriver
+            } else {
+                DriverIssue::DriverLoadFailure
+            }
+        }
+        // Disabled, not started, needs restart, phantom, etc.
+        10 | 14 | 19 | 21 | 22 | 24 | 45 => DriverIssue::StoppedNode,
+        // Stale binding, failed driver entry, failed/aborted load.
+        31 | 37 | 38 | 39 => DriverIssue::DriverLoadFailure,
+        // CM_PROB_UNSIGNED_DRIVER.
+        52 => DriverIssue::SignatureFailure,
+        // Blocked driver / boot-time blocked.
+        43 | 44 | 48 => DriverIssue::Blocked,
+        // CM_PROB_NORMAL_CONFLICT.
+        12 => DriverIssue::ResourceConflict,
+        // Status not OK but no code: empty service ⇒ missing, else unknown.
+        0 if no_service => DriverIssue::MissingDriver,
+        _ => DriverIssue::Unknown,
+    };
+    Some(issue)
+}
+
+fn is_stlink_device(device: &nusb::DeviceInfo) -> bool {
+    device.vendor_id() == 0x0483 && (0x3748..=0x3757).contains(&device.product_id())
+}
+
+fn cmd_mcu_alive() -> Result<()> {
+    let probes: Vec<nusb::DeviceInfo> = nusb::list_devices()
+        .wait()
+        .context("failed to enumerate USB hardware through nusb")?
+        .filter(is_stlink_device)
+        .collect();
+
+    println!("=== Minimal MCU Alive Test ===");
+    println!("Safety: no target reset, halt, flash read/write, erase, or unlock is requested.");
+    println!("The SWD discovery scan may reset the SWD debug link state.");
+
+    if probes.is_empty() {
+        println!("Step 1 - USB probe: FAIL - no ST-Link USB device found");
+        println!("Step 2 - Debug interface: SKIP");
+        println!("Step 3 - Target SWD response: SKIP");
+        return Ok(());
+    }
+
+    for probe in probes {
+        let vid = probe.vendor_id();
+        let pid = probe.product_id();
+        let serial = probe.serial_number().unwrap_or("");
+        let selector = if serial.is_empty() {
+            format!("{vid:04x}:{pid:04x}")
+        } else {
+            format!("{vid:04x}:{pid:04x}:{serial}")
+        };
+
+        println!("\n[{selector}]");
+        println!(
+            "Step 1 - USB probe: PASS - product {:?}, serial {:?}, speed {:?}",
+            probe.product_string(),
+            probe.serial_number(),
+            probe.speed()
+        );
+
+        if let Some(StlinkDriver::Other(state)) = stlink_driver_check(pid) {
+            println!("Step 2 - Debug interface: FAIL - {state}");
+            println!("Step 3 - Target SWD response: SKIP - no host-to-probe command path");
+            if let Some(advice) =
+                known_driver_advice(&format!("USB\\VID_{vid:04X}&PID_{pid:04X}&MI_00"))
+            {
+                println!("Required driver binding: {}", advice.name);
+                println!("Install: {}", advice.install);
+                report_local_driver_availability(&advice);
+            }
             continue;
         }
 
-        let (busid, rest) = take_token(trimmed);
-        let (vidpid, rest) = take_token(rest);
-        let mut device = rest.trim().to_string();
-        let mut state = String::new();
-        for cand in states {
-            if let Some(stripped) = device.strip_suffix(cand) {
-                device = stripped.trim_end().to_string();
-                state = cand.to_string();
+        println!("Step 2 - Debug interface: attempting read-only open through probe-rs");
+        let output = Command::new("probe-rs")
+            .args([
+                "info",
+                "--probe",
+                &selector,
+                "--protocol",
+                "swd",
+                "--speed",
+                "100",
+                "--non-interactive",
+            ])
+            .output()
+            .context("probe-rs not found on PATH (install with: cargo install probe-rs-tools)")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() {
+            println!("Step 2 - Debug interface: PASS - ST-Link accepted commands");
+            println!("Step 3 - Target SWD response: PASS - probe-rs discovered a target at 100 kHz");
+            for line in stdout
+                .lines()
+                .chain(stderr.lines())
+                .map(str::trim)
+                .filter(|line| {
+                    !line.is_empty()
+                        && !line.starts_with('-')
+                        && !line.eq_ignore_ascii_case("Probing target via SWD")
+                })
+                .take(12)
+            {
+                println!("  {line}");
+            }
+        } else {
+            let error = stderr
+                .lines()
+                .chain(stdout.lines())
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('-'))
+                .last()
+                .unwrap_or("probe-rs could not complete SWD discovery");
+            let opened = !error.to_ascii_lowercase().contains("driver")
+                && !error.to_ascii_lowercase().contains("open the debug probe")
+                && !error.to_ascii_lowercase().contains("usb error");
+            println!(
+                "Step 2 - Debug interface: {}",
+                if opened {
+                    "PASS - probe opened; SWD stage failed"
+                } else {
+                    "FAIL - probe could not be opened"
+                }
+            );
+            println!("Step 3 - Target SWD response: FAIL - {error}");
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Native ST-Link SWD reader (--mcu-alive-native)
+//
+// Speaks the ST-Link bulk command protocol directly over `nusb`, so no
+// external tool (probe-rs / pyocd / stlink) is needed. The only thing it
+// requires on Windows is a WinUSB binding on the MI_00 vendor interface — the
+// irreducible minimum, since user-mode cannot issue bulk transfers to a
+// driverless interface (see `--install-driver`). On Linux/macOS nusb's libusb
+// / IOKit backend can claim the interface without a manual driver step.
+//
+// Command/response layout cross-checked against probe-rs, stlink-org/stlink,
+// and OpenOCD. The sequence is read-only: it enters SWD and reads ID registers
+// only — no halt, reset, erase, or memory write is ever issued.
+// ============================================================================
+
+const STLINK_CMD_SIZE: usize = 16;
+const STLINK_GET_VERSION: u8 = 0xF1;
+const STLINK_GET_TARGET_VOLTAGE: u8 = 0xF7;
+const STLINK_DEBUG_COMMAND: u8 = 0xF2;
+const STLINK_DEBUG_APIV2_ENTER: u8 = 0x30;
+const STLINK_DEBUG_ENTER_SWD: u8 = 0xA3;
+const STLINK_DEBUG_APIV2_READ_IDCODES: u8 = 0x31;
+const STLINK_DEBUG_APIV2_READDEBUGREG: u8 = 0x36;
+const STLINK_JTAG_OK: u8 = 0x80;
+
+fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// An opened ST-Link debug interface. Owns the device/interface handles so the
+/// endpoints stay valid for the link's lifetime.
+struct StlinkLink {
+    _device: nusb::Device,
+    _iface: nusb::Interface,
+    ep_out: Endpoint<Bulk, Out>,
+    ep_in: Endpoint<Bulk, In>,
+    in_max: usize,
+}
+
+impl StlinkLink {
+    /// Open a probe end to end: open the USB device, claim its `MI_00`
+    /// vendor/debug interface, open the bulk endpoints, and resync the pipes.
+    /// Returns an error whose message names the failing stage — notably
+    /// `claim_interface` failing is the Windows "no WinUSB on MI_00" boundary.
+    fn open_device(probe: &nusb::DeviceInfo) -> Result<Self> {
+        let device = probe.open().wait().context("open USB device")?;
+        let iface_num = probe
+            .interfaces()
+            .find(|i| i.class() == 0xff)
+            .map(|i| i.interface_number())
+            .unwrap_or(0);
+        let iface = device
+            .claim_interface(iface_num)
+            .wait()
+            .with_context(|| format!("claim MI_{iface_num:02} (needs WinUSB on MI_00)"))?;
+        // RX is 0x81 on every ST-Link; TX is 0x02 on the original V2, else 0x01.
+        let ep_out_addr = if probe.product_id() == 0x3748 { 0x02 } else { 0x01 };
+        let out = iface
+            .endpoint::<Bulk, Out>(ep_out_addr)
+            .map_err(|e| anyhow::anyhow!("open OUT endpoint 0x{ep_out_addr:02x}: {e}"))?;
+        let mut inp = iface
+            .endpoint::<Bulk, In>(0x81)
+            .map_err(|e| anyhow::anyhow!("open IN endpoint 0x81: {e}"))?;
+        let in_max = inp.max_packet_size().max(1);
+        // Reset both pipes' halt/toggle state and drain any stale response left
+        // by a previously interrupted command, so the firmware command FSM
+        // starts in sync. Best-effort: ignore errors on a clean device.
+        let mut out = out;
+        let _ = out.clear_halt().wait();
+        let _ = inp.clear_halt().wait();
+        let mut link = Self { _device: device, _iface: iface, ep_out: out, ep_in: inp, in_max };
+        link.drain_stale();
+        Ok(link)
+    }
+
+    /// Best-effort flush of any response the probe is still waiting to send
+    /// (from an earlier aborted command). Short timeout; stops at the first
+    /// empty/failed read so a clean device costs only one quick poll.
+    fn drain_stale(&mut self) {
+        let timeout = std::time::Duration::from_millis(60);
+        for _ in 0..3 {
+            let completion = self.ep_in.transfer_blocking(Buffer::new(self.in_max), timeout);
+            match completion.status {
+                Ok(()) if !completion.buffer.is_empty() => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// Send a 16-byte (zero-padded) command, then read up to `read_len` bytes.
+    ///
+    /// The bulk IN request length is rounded up to a multiple of the endpoint's
+    /// max packet size: WinUSB rejects a non-multiple read with
+    /// ERROR_INVALID_PARAMETER ("invalid or unsupported argument"). The device
+    /// returns a short packet, so the actual response may be shorter.
+    fn cmd(&mut self, bytes: &[u8], read_len: usize) -> Result<Vec<u8>> {
+        let timeout = std::time::Duration::from_millis(1000);
+        let mut out = vec![0u8; STLINK_CMD_SIZE];
+        out[..bytes.len()].copy_from_slice(bytes);
+        self.ep_out
+            .transfer_blocking(Buffer::from(out), timeout)
+            .into_result()
+            .map_err(|e| anyhow::anyhow!("bulk OUT failed: {e}"))?;
+        if read_len == 0 {
+            return Ok(Vec::new());
+        }
+        let request = read_len.div_ceil(self.in_max) * self.in_max;
+        let resp = self
+            .ep_in
+            .transfer_blocking(Buffer::new(request), timeout)
+            .into_result()
+            .map_err(|e| anyhow::anyhow!("bulk IN failed: {e}"))?;
+        Ok(resp.into_vec())
+    }
+
+    /// Probe firmware version (read-only, valid in any mode).
+    fn get_version(&mut self) -> Result<String> {
+        let r = self.cmd(&[STLINK_GET_VERSION], 6)?;
+        if r.len() < 2 {
+            anyhow::bail!("short version response ({} bytes)", r.len());
+        }
+        let v = ((r[0] as u16) << 8) | r[1] as u16;
+        Ok(format!(
+            "ST-Link v{} JTAG/SWD v{} SWIM v{}",
+            (v >> 12) & 0x0F,
+            (v >> 6) & 0x3F,
+            v & 0x3F
+        ))
+    }
+
+    /// Target reference voltage in millivolts (read-only ADC sample).
+    fn get_voltage_mv(&mut self) -> Result<u32> {
+        let r = self.cmd(&[STLINK_GET_TARGET_VOLTAGE], 8)?;
+        let factor = le_u32(&r, 0).context("short voltage response")?;
+        let reading = le_u32(&r, 4).context("short voltage response")?;
+        if factor == 0 {
+            anyhow::bail!("voltage divisor is zero (probe not ready)");
+        }
+        Ok((2400u64 * reading as u64 / factor as u64) as u32)
+    }
+
+    /// Enter SWD mode. Returns the probe status byte (0x80 = OK). This does not
+    /// halt or reset the core — it only initializes the debug link.
+    fn enter_swd(&mut self) -> Result<u8> {
+        let r = self.cmd(
+            &[STLINK_DEBUG_COMMAND, STLINK_DEBUG_APIV2_ENTER, STLINK_DEBUG_ENTER_SWD],
+            2,
+        )?;
+        Ok(r.first().copied().unwrap_or(0))
+    }
+
+    /// Read the DP IDCODE (DPIDR) — the first read-only target ID.
+    fn read_idcode(&mut self) -> Result<u32> {
+        let r = self.cmd(&[STLINK_DEBUG_COMMAND, STLINK_DEBUG_APIV2_READ_IDCODES], 12)?;
+        le_u32(&r, 4).context("short idcode response")
+    }
+
+    /// Read a 32-bit debug/AP register at `addr` (read-only). The ST-Link
+    /// firmware drives the AHB-AP for this command, so no AP setup is needed.
+    fn read_debug_reg(&mut self, addr: u32) -> Result<u32> {
+        let a = addr.to_le_bytes();
+        let r = self.cmd(
+            &[STLINK_DEBUG_COMMAND, STLINK_DEBUG_APIV2_READDEBUGREG, a[0], a[1], a[2], a[3]],
+            8,
+        )?;
+        if r.first().copied().unwrap_or(0) != STLINK_JTAG_OK {
+            anyhow::bail!("debug-reg read 0x{addr:08X} status 0x{:02X}", r.first().copied().unwrap_or(0));
+        }
+        le_u32(&r, 4).context("short debug-reg response")
+    }
+}
+
+/// After ENTER_SWD, read the read-only identity registers into a map keyed by
+/// address (the shape `decode_stlink_regs` consumes), and resolve the chip
+/// (a matching `.chip` file in `db` wins over the built-in table). Returns
+/// `(regs, dev_id, resolved)`.
+fn stlink_read_regs(
+    link: &mut StlinkLink,
+    db: &[ChipDef],
+) -> (HashMap<u32, Vec<u32>>, Option<u16>, Option<ResolvedChip>) {
+    let mut regs: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(cpuid) = link.read_debug_reg(0xE000ED00) {
+        regs.insert(0xE000ED00, vec![cpuid]);
+    }
+    // DBGMCU_IDCODE: 0xE0042000 on Cortex-M3/M4/M7 STM32, 0x40015800 on M0.
+    let mut idcode = None;
+    for &addr in &[0xE0042000u32, 0x40015800u32] {
+        if let Ok(v) = link.read_debug_reg(addr) {
+            if (v & 0xFFF) != 0 && (v & 0xFFF) != 0xFFF {
+                regs.insert(0xE0042000, vec![v]);
+                idcode = Some(v);
                 break;
             }
         }
-        out.push(Entry {
-            busid: busid.to_string(),
-            vidpid: vidpid.to_string(),
-            device,
-            state,
-        });
     }
-    out
+    let dev_id = idcode.map(|v| (v & 0xFFF) as u16);
+    let resolved = dev_id.and_then(|d| resolve_chip(d, db));
+    if let Some(r) = resolved.as_ref() {
+        // Flash size is a 16-bit field that may be non-word-aligned (0x1FFF7A22
+        // on F4/F7); READDEBUGREG only reads aligned words, so read the
+        // containing word and keep the correct half in the low 16 bits.
+        if let Some(fsa) = r.flash_size_addr {
+            if let Ok(word) = link.read_debug_reg(fsa & !0x3) {
+                regs.insert(fsa, vec![(word >> ((fsa & 0x3) * 8)) & 0xFFFF]);
+            }
+        }
+        if let Some(uid_addr) = r.uid_addr {
+            let mut uid = Vec::new();
+            for k in 0..3 {
+                match link.read_debug_reg(uid_addr + k * 4) {
+                    Ok(v) => uid.push(v),
+                    Err(_) => break,
+                }
+            }
+            if uid.len() == 3 {
+                regs.insert(uid_addr, uid);
+            }
+        }
+        if let Some(rdp_addr) = r.rdp_addr {
+            if let Ok(v) = link.read_debug_reg(rdp_addr) {
+                regs.insert(rdp_addr, vec![v]);
+            }
+        }
+    }
+    (regs, dev_id, resolved)
 }
 
-fn take_token(s: &str) -> (&str, &str) {
-    let s = s.trim_start();
-    match s.find(char::is_whitespace) {
-        Some(i) => (&s[..i], s[i..].trim_start()),
-        None => (s, ""),
+/// Build ordered (key, value) identity rows from decoded registers, applying
+/// `.chip` overrides (name, SRAM, source) and a flash fallback for parts the
+/// built-in family table doesn't cover.
+fn format_target_rows(
+    regs: &HashMap<u32, Vec<u32>>,
+    dev_id: Option<u16>,
+    resolved: Option<&ResolvedChip>,
+) -> Vec<(&'static str, String)> {
+    let mut map = decode_stlink_regs(regs, dev_id);
+    if let Some(r) = resolved {
+        if let Some(did) = dev_id {
+            map.insert("Device ID".into(), format!("0x{:03X} — {}", did, r.name));
+        }
+        if let Some(kb) = r.sram_kb {
+            map.insert("SRAM".into(), format!("{kb} KB"));
+        }
+        // Flash + RDP fallback for a model the built-in table doesn't cover
+        // (decode only reads those for built-in families).
+        if !map.contains_key("Flash size") {
+            if let Some(kb) = r.flash_size_addr.and_then(|a| regs.get(&a)).and_then(|w| w.first()).copied() {
+                if kb != 0 && kb != 0xFFFF {
+                    map.insert("Flash size".into(), format!("{kb} KB"));
+                    map.insert("Flash map".into(), format!("0x08000000-0x{:08X}", 0x08000000u32 + kb * 1024 - 1));
+                }
+            }
+        }
+        if !map.contains_key("Read protection") {
+            if let (Some(addr), Some(kind)) = (r.rdp_addr, r.rdp_kind) {
+                if let Some(opt) = regs.get(&addr).and_then(|w| w.first()).copied() {
+                    map.insert("Read protection".into(), decode_rdp(opt, kind));
+                }
+            }
+        }
+        map.insert("Source".into(), r.source.clone());
     }
+    // The native path doesn't set a fixed SWD clock; correct decode's default.
+    if map.contains_key("Transport") {
+        map.insert("Transport".into(), "SWD (native nusb, read-only)".into());
+    }
+    [
+        "Device ID", "Revision", "Core", "Architecture", "Max clock", "Flash size",
+        "Flash map", "SRAM", "Unique ID", "Read protection", "Transport", "Access", "Source",
+    ]
+    .iter()
+    .filter_map(|k| map.get(*k).map(|v| (*k, v.clone())))
+    .collect()
+}
+
+fn cmd_mcu_alive_native() -> Result<()> {
+    let probes: Vec<nusb::DeviceInfo> = nusb::list_devices()
+        .wait()
+        .context("failed to enumerate USB hardware through nusb")?
+        .filter(is_stlink_device)
+        .collect();
+
+    println!("=== Native ST-Link SWD Probe (no probe-rs / pyocd / stlink) ===");
+    println!("Transport: raw USB bulk to MI_00 via nusb. On Windows this needs WinUSB on MI_00 (see --install-driver).");
+    println!("Safety: only ENTER_SWD + read-only ID-register reads are issued — no halt, reset, erase, or memory write.");
+
+    let chip_db = load_chip_db();
+    if chip_db.is_empty() {
+        println!("Chip data: built-in family table only (drop etc/chips/*.chip files to extend/override).");
+    } else {
+        println!("Chip data: {} external .chip definition(s) loaded; they take priority over the built-in table.", chip_db.len());
+    }
+
+    if probes.is_empty() {
+        println!("Step 1 - USB probe: FAIL - no ST-Link USB device found");
+        return Ok(());
+    }
+
+    for probe in probes {
+        let vid = probe.vendor_id();
+        let pid = probe.product_id();
+        let serial = probe.serial_number().unwrap_or("");
+        println!(
+            "\n[{vid:04x}:{pid:04x}{}] {}",
+            if serial.is_empty() { String::new() } else { format!(":{serial}") },
+            probe.product_string().unwrap_or("ST-Link")
+        );
+
+        let mut link = match StlinkLink::open_device(&probe) {
+            Ok(l) => {
+                println!("Step 1/2 - open + claim MI_00: PASS - bulk transfers available");
+                l
+            }
+            Err(e) => {
+                println!("Step 1/2 - open + claim MI_00: FAIL - {e}");
+                println!("  No-driver boundary: descriptors are readable, transfers are not.");
+                println!("  Minimal fix (WinUSB on MI_00 only — no vendor driver / no probe-rs):");
+                println!("    usbipd-rs --install-driver --confirm   (run in an Administrator shell)");
+                continue;
+            }
+        };
+
+        match link.get_version() {
+            Ok(v) => println!("Step 3 - probe firmware: PASS - {v}"),
+            Err(e) => {
+                println!("Step 3 - probe firmware: FAIL - {e}");
+                continue;
+            }
+        }
+
+        match link.get_voltage_mv() {
+            Ok(mv) => println!("Step 4 - target voltage: {:.2} V", mv as f64 / 1000.0),
+            Err(e) => println!("Step 4 - target voltage: FAIL - {e}"),
+        }
+
+        let status = match link.enter_swd() {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Step 5 - enter SWD: FAIL - {e}");
+                continue;
+            }
+        };
+        if status == STLINK_JTAG_OK {
+            println!("Step 5 - enter SWD: PASS (status 0x80, core not halted)");
+        } else {
+            println!("Step 5 - enter SWD: WARN - status 0x{status:02X} (no target on SWD / wrong wiring?); continuing read attempts");
+        }
+
+        // ── Layer 2: read-only target identity ──
+        match link.read_idcode() {
+            Ok(dpidr) => println!("Step 6 - DP IDCODE (DPIDR): 0x{dpidr:08X}"),
+            Err(e) => println!("Step 6 - DP IDCODE: FAIL - {e}"),
+        }
+
+        let (regs, dev_id, resolved) = stlink_read_regs(&mut link, &chip_db);
+        let rows = format_target_rows(&regs, dev_id, resolved.as_ref());
+        println!("Step 7 - target identity (read-only):");
+        if rows.is_empty() {
+            println!("  (no identity registers read — is an STM32 wired to the SWD header?)");
+        } else {
+            for (k, v) in rows {
+                println!("  {:<18} {v}", format!("{k}:"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -2351,3 +4289,201 @@ fn run_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stlink_v2_1_profile_describes_the_usb_controller_not_the_target() {
+        let profile = stlink_controller_profile(0x374b).expect("known ST-Link/V2-1 PID");
+
+        assert_eq!(profile.controller_mcu, "STM32F103CBT6");
+        assert_eq!(profile.core, "Arm Cortex-M3");
+        assert_eq!(profile.flash, "128 KB");
+        assert_eq!(profile.sram, "20 KB");
+        assert_eq!(profile.flash_map, "0x08000000-0x0801FFFF");
+        assert!(profile.self_debug.contains("external probe required"));
+        assert!(profile.downstream.starts_with("SWD"));
+    }
+
+    #[test]
+    fn layer2_decoder_identifies_stm32f446_without_writing_target() {
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x410FC241]);
+        regs.insert(0xE0042000, vec![0x10000421]);
+        regs.insert(0x1FFF7A22, vec![512]);
+        regs.insert(0x1FFF7A10, vec![0x11223344, 0x55667788, 0x99AABBCC]);
+        regs.insert(0x40023C14, vec![0x0000AA00]);
+
+        let info = decode_stlink_regs(&regs, Some(0x421));
+
+        assert!(info["Device ID"].contains("STM32F446"));
+        assert!(info["Core"].contains("Cortex-M4"));
+        assert_eq!(info["Flash size"], "512 KB");
+        assert_eq!(info["Flash map"], "0x08000000-0x0807FFFF");
+        assert!(info["Read protection"].contains("Disabled"));
+        assert_eq!(info["Access"], "Read-only identity registers");
+    }
+
+    fn node(status: &str, problem: &str, service: &str) -> WindowsUsbDriverNode {
+        let mut n = WindowsUsbDriverNode::default();
+        n.set_field("STATUS", status);
+        n.set_field("PROBLEM", problem);
+        n.set_field("SERVICE", service);
+        n
+    }
+
+    #[test]
+    fn healthy_node_has_no_issue() {
+        assert_eq!(classify_driver_issue(&node("OK", "0", "WINUSB")), None);
+        assert_eq!(classify_driver_issue(&node("OK", "", "usbccgp")), None);
+    }
+
+    #[test]
+    fn problem_28_without_service_is_a_missing_driver() {
+        // The real ST-Link MI_00 case: enumerated, code 28, no bound service.
+        assert_eq!(
+            classify_driver_issue(&node("Error", "28", "")),
+            Some(DriverIssue::MissingDriver)
+        );
+    }
+
+    #[test]
+    fn problem_28_with_service_is_a_load_failure_not_a_gap() {
+        assert_eq!(
+            classify_driver_issue(&node("Error", "28", "WINUSB")),
+            Some(DriverIssue::DriverLoadFailure)
+        );
+    }
+
+    #[test]
+    fn problem_codes_map_to_distinct_categories() {
+        assert_eq!(classify_driver_issue(&node("Error", "22", "x")), Some(DriverIssue::StoppedNode));
+        assert_eq!(classify_driver_issue(&node("Error", "39", "x")), Some(DriverIssue::DriverLoadFailure));
+        assert_eq!(classify_driver_issue(&node("Error", "52", "x")), Some(DriverIssue::SignatureFailure));
+        assert_eq!(classify_driver_issue(&node("Error", "43", "x")), Some(DriverIssue::Blocked));
+        assert_eq!(classify_driver_issue(&node("Error", "12", "x")), Some(DriverIssue::ResourceConflict));
+        assert_eq!(classify_driver_issue(&node("Error", "99", "x")), Some(DriverIssue::Unknown));
+    }
+
+    #[test]
+    fn stlink_mi00_advice_points_at_a_bundled_inf() {
+        let advice = known_driver_advice("USB\\VID_0483&PID_374B&MI_00\\7&abc&0&0000")
+            .expect("ST-Link MI_00 has known advice");
+        assert!(advice.name.contains("STSW-LINK009"));
+        assert_eq!(advice.local_inf, Some("windows-driver/stsw-link009/stlink_dbg_winusb.inf"));
+        // The healthy sibling interfaces must not match this binding.
+        assert!(known_driver_advice("USB\\VID_0483&PID_374B&MI_01\\x").is_none());
+    }
+
+    #[test]
+    fn instance_vidpid_parses_uppercase_and_lowercase() {
+        assert_eq!(instance_vidpid("USB\\VID_0483&PID_374B&MI_00\\x"), Some((0x0483, 0x374b)));
+        assert_eq!(instance_vidpid("usb\\vid_10c4&pid_ea60"), Some((0x10c4, 0xea60)));
+        assert_eq!(instance_vidpid("not-a-usb-id"), None);
+    }
+
+    #[test]
+    fn driverstore_parser_extracts_oem_name_for_matching_block() {
+        // Two blocks separated by a blank line; only the second mentions our INF.
+        let text = "Published Name: oem10.inf\r\nOriginal Name: usbser.inf\r\n\r\nPublished Name: oem42.inf\r\nOriginal Name: stlink_dbg_winusb.inf\r\nProvider: STMicroelectronics";
+        assert_eq!(parse_driverstore_oem(text, "stlink_dbg_winusb.inf"), vec!["oem42.inf"]);
+        assert!(parse_driverstore_oem(text, "absent.inf").is_empty());
+    }
+
+    #[test]
+    fn driverstore_parser_handles_lf_only_and_trailing_punctuation() {
+        let text = "Published Name: oem7.inf,\nOriginal Name: stlink_dbg_winusb.inf";
+        assert_eq!(parse_driverstore_oem(text, "STLINK_DBG_WINUSB.INF"), vec!["oem7.inf"]);
+    }
+
+    #[test]
+    fn le_u32_reads_little_endian_at_offset() {
+        // ST-Link debug-reg / idcode responses place the 32-bit value at offset 4.
+        let resp = [0x80, 0x00, 0x00, 0x00, 0x41, 0x10, 0x00, 0x10];
+        assert_eq!(le_u32(&resp, 4), Some(0x10001041));
+        assert_eq!(le_u32(&resp, 0), Some(0x0000_0080));
+        assert_eq!(le_u32(&resp, 6), None); // out of bounds, no panic
+    }
+
+    #[test]
+    fn chip_file_parses_stlink_format() {
+        let text = "\
+# comment line
+dev_type STM32F446
+chip_id 0x421                // STM32_CHIPID_F446
+flash_type F2_F4
+flash_size_reg 0x1fff7a22
+sram_size 0x20000            // 128 KB
+option_base 0x40023c14
+";
+        let def = parse_chip_file(text).expect("has chip_id");
+        assert_eq!(def.dev_id, 0x421);
+        assert_eq!(def.name, "STM32F446");
+        assert_eq!(def.flash_size_addr, Some(0x1FFF7A22));
+        assert_eq!(def.sram_kb, Some(128));
+        assert!(parse_chip_file("dev_type Foo\n").is_none()); // no chip_id
+    }
+
+    #[test]
+    fn chip_int_accepts_hex_and_decimal() {
+        assert_eq!(parse_chip_int("0x20000"), Some(0x20000));
+        assert_eq!(parse_chip_int("0X10"), Some(16));
+        assert_eq!(parse_chip_int("512"), Some(512));
+        assert_eq!(parse_chip_int("0x421,"), Some(0x421)); // trailing punctuation
+    }
+
+    #[test]
+    fn resolve_chip_falls_back_to_builtin_when_no_file() {
+        let r = resolve_chip(0x421, &[]).expect("F446 is built-in");
+        assert!(r.name.contains("STM32F446"));
+        assert_eq!(r.flash_size_addr, Some(0x1FFF7A22));
+        assert_eq!(r.uid_addr, Some(0x1FFF7A10)); // verified built-in UID addr
+        assert_eq!(r.sram_kb, Some(128));
+        assert_eq!(r.source, "built-in");
+    }
+
+    #[test]
+    fn resolve_chip_file_overrides_builtin_but_keeps_verified_addrs() {
+        let db = vec![ChipDef {
+            dev_id: 0x421,
+            name: "My Custom F446 Board".to_string(),
+            flash_size_addr: Some(0x1FFF7A22),
+            sram_kb: Some(128),
+            source: "etc/chips/F446.chip".to_string(),
+        }];
+        let r = resolve_chip(0x421, &db).unwrap();
+        assert_eq!(r.name, "My Custom F446 Board"); // file name wins
+        assert_eq!(r.uid_addr, Some(0x1FFF7A10)); // UID still from built-in
+        assert_eq!(r.source, "etc/chips/F446.chip");
+    }
+
+    #[test]
+    fn resolve_chip_file_adds_a_part_unknown_to_builtin() {
+        let db = vec![ChipDef {
+            dev_id: 0x999,
+            name: "STM32 Experimental".to_string(),
+            flash_size_addr: Some(0x1FFF7A22),
+            sram_kb: Some(64),
+            source: "etc/chips/X.chip".to_string(),
+        }];
+        let r = resolve_chip(0x999, &db).expect("file-defined part resolves");
+        assert_eq!(r.name, "STM32 Experimental");
+        assert_eq!(r.flash_size_addr, Some(0x1FFF7A22));
+        assert_eq!(r.sram_kb, Some(64));
+        assert_eq!(r.uid_addr, None); // not in built-in → no UID/RDP
+        assert_eq!(r.rdp_addr, None);
+        assert!(resolve_chip(0x999, &[]).is_none()); // unknown without a file
+    }
+
+    #[test]
+    fn native_dbgmcu_idcode_decodes_to_stm32_family() {
+        // What --mcu-alive-native feeds decode_stlink_regs after reading DBGMCU.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x410FC241]); // CPUID: Cortex-M4
+        regs.insert(0xE0042000, vec![0x10010421]); // DBGMCU: DEV_ID 0x421 = F446
+        let info = decode_stlink_regs(&regs, Some(0x421));
+        assert!(info["Device ID"].contains("STM32F446"));
+        assert!(info["Core"].contains("Cortex-M4"));
+    }
+}

@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-binary Rust CLI that lists connected USB devices (in `usbipd list`
-format), flags "probable boards" by VID:PID, and probes each with a
+A single-binary Rust CLI that lists connected USB devices natively via
+`nusb`, flags "probable boards" by VID:PID, and probes each with a
 chip-specific external tool (espflash / avrdude / picotool / DAPLink / pyocd).
 
 ## Commands
@@ -14,9 +14,14 @@ chip-specific external tool (espflash / avrdude / picotool / DAPLink / pyocd).
 cargo build --release                 # build
 cargo run --release -- --probe        # run with args after `--`
 cargo run --release -- --list-tools   # e.g. inspect installer status
+cargo test                            # unit tests (pure decoders/parsers/classifiers)
 ```
 
-There is no test suite — the crate ships zero `#[test]`/`#[cfg(test)]` code.
+The crate ships a `#[cfg(test)] mod tests` at the bottom of
+`src/bin/usbipd-rs.rs` covering the pure logic: ST-Link controller/target
+decoders, SWD failure classification, the driver-issue classifier
+(`classify_driver_issue`), driver advice/INF lookup, and the `pnputil`
+driver-store parser. Keep new pure helpers testable and add cases there.
 CI builds with `RUSTFLAGS: "-D warnings"`, so **`cargo build` must be
 warning-clean** or the GitHub Actions build fails.
 
@@ -30,17 +35,23 @@ two largely independent subsystems.
 
 ### 1. USB listing + board probing (default command, `--probe`)
 
-- `run_usbipd_list()` shells out to `usbipd.exe list` and `parse_usbipd()`
-  turns its text columns into `Vec<Entry>`. `nusb_by_vidpid()` enriches each
-  row with USB speed via the `nusb` crate.
+- `nusb_entries()` enumerates connected USB devices directly and turns them
+  into `Vec<Entry>`. `nusb_by_vidpid()` enriches each row with USB speed.
 - `KNOWN_BOARDS: &[KnownBoard]` is a static VID:PID → `(name, &[ProbeKind])`
   table; `lookup_board(vid, pid)` matches a device against it.
 - With `--probe`, `probe_boards()` runs each matched board's `ProbeKind`
-  pipeline. Each `ProbeKind` variant (`Espflash`, `Avrdude`, `Picotool`,
-  `Daplink`, `Pyocd`) shells out to an external CLI and has a paired
+  pipeline. Most `ProbeKind` variants (`Espflash`, `Avrdude`, `Picotool`,
+  `Daplink`, `Pyocd`) shell out to an external CLI and have a paired
   `run_*` function (invoke + parse output into a `HashMap`) and `print_*`
   function (format). A board's `probes` is a slice, so one device can chain
   probes — e.g. the DAPLink entry uses `[Daplink, Pyocd]`.
+- The ST-Link entry uses `[Stlink, StlinkTarget]`. `Stlink` (layer 1) names the
+  controller from VID:PID/descriptors. `StlinkTarget` (layer 2) is **not** an
+  external tool: `run_stlink_target_query()` reuses the native `StlinkLink`
+  reader to enter SWD and read the downstream MCU's identity read-only. It runs
+  automatically under `--probe` (no separate flag) and auto-detects target
+  presence — when nothing answers it returns a one-layer result. There is no
+  `--probe-layer2`.
 
 ### 2. Tool installer (`--install`, `--list-tools`)
 
@@ -59,16 +70,39 @@ two largely independent subsystems.
 - Probe tools are invoked by bare name (`Command::new("avrdude")`) so they
   must be on `PATH`. `picotool` is the exception: `find_picotool()` searches
   bundled paths and the `PICOTOOL_PATH` env var.
-- **Probing resets the target chip** (toggles DTR/RTS or asserts SWD reset).
-  Never probe a port with live firmware on it.
-- Listing source is OS-dispatched in `list_entries()`: Windows parses
-  `usbipd.exe list` (for the share/attach STATE column); macOS/Linux enumerate
-  natively via `nusb` in `nusb_entries()` (BUSID synthesized as
-  `bus-address`, STATE blank). All sub-commands (`--probe`, `--install`) work
-  on every OS.
+- **Serial-bootloader probing resets the target chip** (espflash / stm32flash /
+  avrdude toggle DTR/RTS). Never run those on a port with live firmware. The
+  ST-Link layer-2 step is the exception: it is read-only native SWD (enter +
+  read ID registers, no halt/reset/erase/write).
+- `list_entries()` uses `nusb_entries()` on every OS. BUSID is synthesized
+  from the native bus and physical `port_chain()` topology; native enumeration
+  does not depend on or expose usbip share/attach state. All sub-commands
+  (`--probe`, `--install`) work on every OS.
 - avrdude probes run with `-F` (override the signature check, so a mismatched
   MCU still reports its true signature) and a list of candidate baud rates
   tried in order.
+
+### Native ST-Link SWD reader (`--mcu-alive-native`)
+
+- `cmd_mcu_alive_native()` speaks the ST-Link bulk command protocol directly
+  via `nusb` (no probe-rs / pyocd / stlink). `StlinkLink` wraps the two bulk
+  endpoints (`0x01`/`0x81`, or `0x02` on the original V2) and implements
+  GET_VERSION, GET_TARGET_VOLTAGE, ENTER_SWD, READ_IDCODES, READDEBUGREG. The
+  sequence is read-only — no halt/reset/erase/write. Opcodes/byte-layouts were
+  cross-checked against `../probe-rs`, `../stlink`, `../openocd`.
+- Windows gotchas baked in: bulk IN length must be rounded up to the endpoint
+  max packet size (else WinUSB returns `InvalidArgument`); `open()` does
+  `clear_halt` + a short drain to recover from an interrupted prior command;
+  the flash-size field is read at an aligned address and the correct half-word
+  extracted (it sits at `…A22` on F4/F7). This path needs only WinUSB on
+  `MI_00` (`--install-driver`); `claim_interface` failing is the no-driver
+  boundary, reported explicitly.
+- STM32 identification: `stm_family()` (+ `ADDRS_*`, `builtin_sram_kb`) is the
+  compiled-in base table. `load_chip_db()` reads optional `etc/chips/*.chip`
+  files (stlink subset format) and `resolve_chip()` prefers a matching `.chip`
+  over the built-in table, keeping the verified UID/RDP addresses from built-in.
+  `cortex_core()` / `decode_rdp()` are shared with the pyocd path's
+  `decode_stlink_regs()`.
 
 ## Extending
 
@@ -77,6 +111,10 @@ two largely independent subsystems.
   its `run_*`/`print_*` functions and the match arm in `probe_boards()`.
 - **New installable tool:** add a `ToolSpec` to `TOOLS` (it then appears
   automatically in `--list-tools`).
+- **New STM32 model (native reader):** add a `dev_id` arm to `stm_family()`
+  (and `builtin_sram_kb`) for a compiled-in entry, OR drop a `etc/chips/*.chip`
+  file to add/override one without recompiling. Keep `etc/chips/*.chip`
+  templates in sync with `pack-release.sh`, which bundles them in the archive.
 - The `--help` text in `print_help()` and the VID:PID / installer tables in
   `README.md` are hand-maintained — update them whenever you change
   `KNOWN_BOARDS` or `TOOLS`.

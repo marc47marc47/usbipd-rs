@@ -1,3 +1,4 @@
 /target
+/dist
 Cargo.lock
 /windows-driver/CP210x_VCP_Windows/
