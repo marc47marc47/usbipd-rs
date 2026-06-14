@@ -100,6 +100,11 @@ MCU without destructive operations.
   a physical replug also clears it.
 - The flash-size field is a non-word-aligned 16-bit register on F4/F7; read the
   aligned word and pick the half-word (matches stlink `common_legacy.c`).
+- Some ST-Link/V2 clones STALL unsupported commands (e.g. GET_TARGET_VOLTAGE
+  0xF7). A STALL halts the endpoint; without a CLEAR_FEATURE every later command
+  fails (the OUT then just times out). `cmd()` now clears both halts after a
+  stall, so an unsupported optional command no longer wedges ENTER_SWD. Also
+  leave DFU/SWIM/DEBUG mode before ENTER_SWD (bare V2 often enumerates in DFU).
 - [ ] After installing a valid `MI_00` binding, verify `--mcu-alive` reaches
   the target at 100 kHz.
 - [ ] Report ST-Link firmware version and target voltage before SWD discovery.

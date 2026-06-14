@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use nusb::transfer::{Buffer, Bulk, In, Out};
+use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
 use nusb::{Endpoint, MaybeFuture};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -2090,8 +2090,9 @@ fn run_stlink_target_query(vid: u16, pid: u16) -> Result<HashMap<String, String>
         Err(_) => {
             info.insert(
                 "Layer 2".into(),
-                format!("none - ST-Link present, no SWD/JTAG target on the debug header (enter-SWD status 0x{status:02X})"),
+                format!("none - SWD target did not answer (enter-SWD status 0x{status:02X})"),
             );
+            info.insert("Hint".into(), swd_no_target_hint(&mut link));
             return Ok(info);
         }
     }
@@ -2406,6 +2407,9 @@ fn print_stlink_target_info(info: &HashMap<String, String>, board: &str) {
         }
         if let Some(fix) = info.get("Fix") {
             println!("  Fix:             {fix}");
+        }
+        if let Some(hint) = info.get("Hint") {
+            println!("  Hint:            {hint}");
         }
         return;
     }
@@ -3282,9 +3286,15 @@ fn cmd_mcu_alive() -> Result<()> {
 
 const STLINK_CMD_SIZE: usize = 16;
 const STLINK_GET_VERSION: u8 = 0xF1;
+const STLINK_DFU_COMMAND: u8 = 0xF3;
+const STLINK_DFU_EXIT: u8 = 0x07;
+const STLINK_SWIM_COMMAND: u8 = 0xF4;
+const STLINK_SWIM_EXIT: u8 = 0x01;
+const STLINK_GET_CURRENT_MODE: u8 = 0xF5;
 const STLINK_GET_TARGET_VOLTAGE: u8 = 0xF7;
 const STLINK_DEBUG_COMMAND: u8 = 0xF2;
 const STLINK_DEBUG_APIV2_ENTER: u8 = 0x30;
+const STLINK_DEBUG_EXIT: u8 = 0x21;
 const STLINK_DEBUG_ENTER_SWD: u8 = 0xA3;
 const STLINK_DEBUG_APIV2_READ_IDCODES: u8 = 0x31;
 const STLINK_DEBUG_APIV2_READDEBUGREG: u8 = 0x36;
@@ -3366,20 +3376,41 @@ impl StlinkLink {
         let timeout = std::time::Duration::from_millis(1000);
         let mut out = vec![0u8; STLINK_CMD_SIZE];
         out[..bytes.len()].copy_from_slice(bytes);
-        self.ep_out
+        if let Err(e) = self
+            .ep_out
             .transfer_blocking(Buffer::from(out), timeout)
             .into_result()
-            .map_err(|e| anyhow::anyhow!("bulk OUT failed: {e}"))?;
+        {
+            self.recover_from(e);
+            return Err(anyhow::anyhow!("bulk OUT failed: {e}"));
+        }
         if read_len == 0 {
             return Ok(Vec::new());
         }
         let request = read_len.div_ceil(self.in_max) * self.in_max;
-        let resp = self
+        match self
             .ep_in
             .transfer_blocking(Buffer::new(request), timeout)
             .into_result()
-            .map_err(|e| anyhow::anyhow!("bulk IN failed: {e}"))?;
-        Ok(resp.into_vec())
+        {
+            Ok(resp) => Ok(resp.into_vec()),
+            Err(e) => {
+                self.recover_from(e);
+                Err(anyhow::anyhow!("bulk IN failed: {e}"))
+            }
+        }
+    }
+
+    /// Recover the pipes after a failed transfer. A STALL (the probe rejecting an
+    /// unsupported command, e.g. some ST-Link/V2 clones STALL GET_TARGET_VOLTAGE)
+    /// halts the endpoint; without a CLEAR_FEATURE every later command also fails
+    /// (the OUT side then just times out). Clearing both halts lets the next
+    /// command — e.g. ENTER_SWD — proceed.
+    fn recover_from(&mut self, err: TransferError) {
+        if matches!(err, TransferError::Stall) {
+            let _ = self.ep_out.clear_halt().wait();
+            let _ = self.ep_in.clear_halt().wait();
+        }
     }
 
     /// Probe firmware version (read-only, valid in any mode).
@@ -3408,9 +3439,31 @@ impl StlinkLink {
         Ok((2400u64 * reading as u64 / factor as u64) as u32)
     }
 
-    /// Enter SWD mode. Returns the probe status byte (0x80 = OK). This does not
-    /// halt or reset the core — it only initializes the debug link.
+    /// Current probe mode (0=DFU, 1=mass storage, 2=debug/JTAG, 3=SWIM).
+    fn current_mode(&mut self) -> u8 {
+        self.cmd(&[STLINK_GET_CURRENT_MODE], 2)
+            .ok()
+            .and_then(|r| r.first().copied())
+            .unwrap_or(0xFF)
+    }
+
+    /// Leave whatever mode the probe powered up in, so a fresh ENTER_SWD is
+    /// accepted. A bare ST-Link/V2 often enumerates in DFU mode; entering SWD
+    /// without leaving it first silently fails (status 0x00). Best-effort.
+    fn leave_current_mode(&mut self) {
+        let _ = match self.current_mode() {
+            0 => self.cmd(&[STLINK_DFU_COMMAND, STLINK_DFU_EXIT], 0),
+            2 => self.cmd(&[STLINK_DEBUG_COMMAND, STLINK_DEBUG_EXIT], 0),
+            3 => self.cmd(&[STLINK_SWIM_COMMAND, STLINK_SWIM_EXIT], 0),
+            _ => Ok(Vec::new()),
+        };
+    }
+
+    /// Enter SWD mode. Returns the probe status byte (0x80 = OK). Leaves the
+    /// power-up mode first. This does not halt or reset the core — it only
+    /// initializes the debug link.
     fn enter_swd(&mut self) -> Result<u8> {
+        self.leave_current_mode();
         let r = self.cmd(
             &[STLINK_DEBUG_COMMAND, STLINK_DEBUG_APIV2_ENTER, STLINK_DEBUG_ENTER_SWD],
             2,
@@ -3542,6 +3595,21 @@ fn format_target_rows(
     .collect()
 }
 
+/// Actionable checklist when SWD enters but no target answers (DPIDR fails).
+/// Reads the probe's sense of target voltage — an unreadable / 0 V reading is a
+/// strong sign the target isn't powered or VTREF isn't wired.
+fn swd_no_target_hint(link: &mut StlinkLink) -> String {
+    let volt = link
+        .get_voltage_mv()
+        .map(|mv| format!("{:.2} V", mv as f64 / 1000.0))
+        .unwrap_or_else(|_| "unreadable".into());
+    format!(
+        "probe-sensed target voltage: {volt}. Check: target is powered; ST-Link VTREF(3V3)/SWDIO/SWCLK/GND all wired; \
+         NRST not held low; using the SWD (not JTAG) header. On a Nucleo driven by an EXTERNAL ST-Link, remove the two \
+         CN2 (ST-LINK) jumpers to disconnect the on-board ST-Link, and power the board (USB or E5V)."
+    )
+}
+
 fn cmd_mcu_alive_native() -> Result<()> {
     let probes: Vec<nusb::DeviceInfo> = nusb::list_devices()
         .wait()
@@ -3599,6 +3667,9 @@ fn cmd_mcu_alive_native() -> Result<()> {
 
         match link.get_voltage_mv() {
             Ok(mv) => println!("Step 4 - target voltage: {:.2} V", mv as f64 / 1000.0),
+            Err(e) if e.to_string().contains("stall") => {
+                println!("Step 4 - target voltage: n/a (not reported by this ST-Link)")
+            }
             Err(e) => println!("Step 4 - target voltage: FAIL - {e}"),
         }
 
@@ -3625,7 +3696,8 @@ fn cmd_mcu_alive_native() -> Result<()> {
         let rows = format_target_rows(&regs, dev_id, resolved.as_ref());
         println!("Step 7 - target identity (read-only):");
         if rows.is_empty() {
-            println!("  (no identity registers read — is an STM32 wired to the SWD header?)");
+            println!("  (no identity registers read — no SWD target answered)");
+            println!("  Hint: {}", swd_no_target_hint(&mut link));
         } else {
             for (k, v) in rows {
                 println!("  {:<18} {v}", format!("{k}:"));
