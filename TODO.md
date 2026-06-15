@@ -95,8 +95,24 @@ MCU without destructive operations.
   picoprobe 2e8a:0004) in the two-layer architecture. Layer 1 = RP2040 probe
   profile; layer 2 = native CMSIS-DAP v2 (bulk) SWD read of the downstream
   target, read-only, no probe-rs/pyocd. `CmsisDapLink` + `collect_target_regs`
-  shared with the ST-Link path. Still needs an end-to-end bench run with the
-  probe wired to a target to confirm DPIDR/CPUID/DBGMCU read back.
+  shared with the ST-Link path. Confirmed end-to-end on a Raspberry Pi Debug
+  Probe reading an RP2040 target: DPIDR 0x0BC12477 (multidrop), CHIP_ID
+  0x10002927 (RP2040 B0/B1), CPUID 0x410CC601 (Cortex-M0+), GITREF read back.
+
+### CMSIS-DAP RP2040 multidrop notes (learned)
+
+- A DPv2 part (DPIDR version field >= 2, e.g. RP2040 0x0BC12477) shares the SWD
+  bus with other DPs; a non-selected read returns bus-contention garbage. Must
+  TARGETSEL-select a core (0x01002927 / 0x11002927) before any AP access.
+- The line reset and the TARGETSEL packet MUST be one DAP_SWJ_Sequence — if
+  sent as two separate commands the probe inserts a gap and the select fails
+  (DPIDR read then NoAcks). Bring-up: dormant->SWD alert, then a single
+  sequence of [line reset | TARGETSEL], then read DPIDR.
+- For a single CMSIS-DAP DAP_Transfer the firmware completes the posted AP read
+  and returns the data in that transfer — do NOT then read RDBUFF (it returns
+  stale 0). `read_mem32` = write TAR, read DRW.
+- RP2040 SYSINFO: CHIP_ID 0x40000000 (mfr 0x927, part 0x0002, rev nibble),
+  GITREF_RP2040 0x40000014.
 
 ### Windows WinUSB native-transfer notes (learned)
 
