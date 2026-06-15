@@ -91,6 +91,13 @@ MCU without destructive operations.
   `run_pyocd_commands`, `parse_dap_register`, `diagnose_failure`,
   `pyocd_error_line`, `parse_reg_dump`) and `should_probe_stlink_target`.
 
+- [x] Support RP2040 CMSIS-DAP debug probes (RPi Debug Probe 2e8a:000c,
+  picoprobe 2e8a:0004) in the two-layer architecture. Layer 1 = RP2040 probe
+  profile; layer 2 = native CMSIS-DAP v2 (bulk) SWD read of the downstream
+  target, read-only, no probe-rs/pyocd. `CmsisDapLink` + `collect_target_regs`
+  shared with the ST-Link path. Still needs an end-to-end bench run with the
+  probe wired to a target to confirm DPIDR/CPUID/DBGMCU read back.
+
 ### Windows WinUSB native-transfer notes (learned)
 
 - `claim_interface` failing with "could not determine driver for interface" is

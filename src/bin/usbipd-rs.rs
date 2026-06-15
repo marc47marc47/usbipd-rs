@@ -60,6 +60,13 @@ enum ProbeKind {
     /// flash-size, UID, and read-protection registers, then resets the target
     /// to resume firmware. Never erases, unlocks, dumps, or writes flash.
     StlinkTarget,
+    /// Identify a CMSIS-DAP debug probe itself (layer 1) — e.g. the RP2040-based
+    /// Raspberry Pi Debug Probe / picoprobe — from VID:PID + USB descriptors.
+    CmsisDap,
+    /// Downstream SWD target read (layer 2) through a CMSIS-DAP probe, spoken
+    /// natively over the CMSIS-DAP v2 bulk protocol via nusb. Read-only: brings
+    /// up SWD and reads ID registers only; no halt, reset, erase, or write.
+    CmsisDapTarget,
 }
 
 impl ProbeKind {
@@ -82,6 +89,8 @@ impl ProbeKind {
             ProbeKind::Pyocd => "pyocd",
             ProbeKind::Stlink => "nusb (layer 1 only)",
             ProbeKind::StlinkTarget => "native SWD (layer 2)",
+            ProbeKind::CmsisDap => "nusb (layer 1, CMSIS-DAP)",
+            ProbeKind::CmsisDapTarget => "native CMSIS-DAP SWD (layer 2)",
         }
     }
 }
@@ -104,6 +113,7 @@ const PICO: &[ProbeKind] = &[ProbeKind::Picotool];
 const DFU: &[ProbeKind] = &[ProbeKind::Dfu];
 const DAP_PIPELINE: &[ProbeKind] = &[ProbeKind::Daplink, ProbeKind::Pyocd];
 const STLINK: &[ProbeKind] = &[ProbeKind::Stlink, ProbeKind::StlinkTarget];
+const CMSISDAP: &[ProbeKind] = &[ProbeKind::CmsisDap, ProbeKind::CmsisDapTarget];
 
 // A generic USB-UART bridge (CH340, CP210x, FT2232/FT232H/FT231X) carries no
 // information about which MCU is wired to its TX/RX lines — the same chip
@@ -201,6 +211,11 @@ const KNOWN_BOARDS: &[KnownBoard] = &[
     // Read DETAILS.TXT from MSD first, then ask pyocd what target chip is on
     // the other end of the SWD lines (board database lookup; no chip reset).
     KnownBoard { vid: 0x0d28, pid: 0x0204, name: "DAPLink (mbed CMSIS-DAP)", probes: DAP_PIPELINE },
+
+    // ── RP2040-based CMSIS-DAP debug probes (layer 1 = RP2040; layer 2 = SWD) ──
+    // Native CMSIS-DAP v2 read of the downstream target — no probe-rs/pyocd.
+    KnownBoard { vid: 0x2e8a, pid: 0x000c, name: "Raspberry Pi Debug Probe (RP2040 CMSIS-DAP)", probes: CMSISDAP },
+    KnownBoard { vid: 0x2e8a, pid: 0x0004, name: "Picoprobe (RP2040 CMSIS-DAP)",               probes: CMSISDAP },
 
     // ── ST-Link debug controllers (layer 1 only; downstream target disabled) ──
     KnownBoard { vid: 0x0483, pid: 0x3748, name: "ST-Link/V2 debug controller",   probes: STLINK },
@@ -318,8 +333,9 @@ WHAT GETS DETECTED (VID:PID → board → probe):
     2341:8036 / 8037              Arduino Leonardo / Micro   → AVR  (avrdude)
     2E8A:0003                     RP2040 BOOTSEL (Pi Pico)   → RP2  (picotool)
     2E8A:000F                     RP2350 BOOTSEL (Pi Pico 2) → RP2  (picotool)
+    2E8A:000C / 0004              RPi Debug Probe / picoprobe → DAP (RP2040 layer 1 + native CMSIS-DAP layer 2)
     0D28:0204                     mbed CMSIS-DAP / DAPLink   → DAP+SWD (DETAILS.TXT + pyocd)
-    0483:3748 / 374B / 374E / 374F ST-Link V2 / V2-1 / V3    → STL (layer-1 controller architecture; no SWD/JTAG IO)
+    0483:3748 / 374B / 374E / 374F ST-Link V2 / V2-1 / V3    → STL (STM32 layer 1 + native ST-Link SWD layer 2)
 
 INSTALLABLE TOOLS (see --list-tools for live status):
     espflash    cargo install espflash         ESP chip identification & flashing
@@ -456,6 +472,8 @@ fn cmd_list_usb() -> Result<()> {
                     ProbeKind::Pyocd => "SWD",
                     ProbeKind::Stlink => "STL",
                     ProbeKind::StlinkTarget => "SWD2",
+                    ProbeKind::CmsisDap => "DAP",
+                    ProbeKind::CmsisDapTarget => "SWD2",
                 })
                 .collect();
             println!(
@@ -470,12 +488,22 @@ fn cmd_list_usb() -> Result<()> {
         println!("Run with --probe to query each board (espflash / stm32flash / avrdude / picotool / DAPLink / pyocd).");
         println!("Note: probing may reset the chip — do NOT use while a 3D-printer or");
         println!("      other live firmware is communicating.");
-        if candidates.iter().any(|(e, _)| e.vidpid.starts_with("0483:374")) {
+        let has_stlink = candidates.iter().any(|(e, _)| e.vidpid.starts_with("0483:374"));
+        let has_dap = candidates
+            .iter()
+            .any(|(_, b)| b.probes.iter().any(|p| matches!(p, ProbeKind::CmsisDapTarget)));
+        if has_stlink {
             println!();
             println!("ST-Link present — safe, read-only options (no chip reset):");
             println!("  --mcu-alive-native   read target ID over SWD via nusb (no probe-rs/pyocd).");
             println!("  --driver-status      check the MI_00 debug-interface driver binding (Windows).");
             println!("  --install-driver     bind WinUSB to MI_00 if --mcu-alive-native can't claim it.");
+        }
+        if has_dap {
+            println!();
+            println!("CMSIS-DAP probe present — `--probe` reads the downstream SWD target");
+            println!("read-only via native CMSIS-DAP (no probe-rs/pyocd). On Windows the");
+            println!("'CMSIS-DAP v2' interface must be on WinUSB (use Zadig: --install zadig).");
         }
     }
     Ok(())
@@ -548,6 +576,8 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 ProbeKind::Pyocd => run_pyocd_query(vid, pid),
                 ProbeKind::Stlink => run_stlink_controller_query(vid, pid),
                 ProbeKind::StlinkTarget => run_stlink_target_query(vid, pid),
+                ProbeKind::CmsisDap => run_cmsisdap_controller_query(vid, pid),
+                ProbeKind::CmsisDapTarget => run_cmsisdap_target_query(vid, pid),
             };
 
             match result {
@@ -566,6 +596,8 @@ fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                         ProbeKind::Pyocd => print_pyocd_info(&info),
                         ProbeKind::Stlink => print_stlink_controller_info(&info),
                         ProbeKind::StlinkTarget => print_stlink_target_info(&info, board.name),
+                        ProbeKind::CmsisDap => print_stlink_controller_info(&info),
+                        ProbeKind::CmsisDapTarget => print_stlink_target_info(&info, board.name),
                     }
                 }
                 Ok(_) => println!("  (no info parsed from output)"),
@@ -619,6 +651,8 @@ fn flasher_suggestion(board: &KnownBoard) -> Option<(&'static str, String)> {
             ProbeKind::Avrdude { .. } => ("ravedude — AVR `cargo run` flasher (Rust)", "cargo install ravedude".into()),
             ProbeKind::Stlink
             | ProbeKind::StlinkTarget
+            | ProbeKind::CmsisDap
+            | ProbeKind::CmsisDapTarget
             | ProbeKind::Pyocd
             | ProbeKind::Daplink
             | ProbeKind::Stm32Flash
@@ -3506,14 +3540,24 @@ fn stlink_read_regs(
     link: &mut StlinkLink,
     db: &[ChipDef],
 ) -> (HashMap<u32, Vec<u32>>, Option<u16>, Option<ResolvedChip>) {
+    collect_target_regs(|addr| link.read_debug_reg(addr), db)
+}
+
+/// Read the read-only identity registers using a generic 32-bit reader closure
+/// (ST-Link READDEBUGREG or CMSIS-DAP MEM-AP), resolve the chip (a matching
+/// `.chip` file wins), and return `(regs, dev_id, resolved)`.
+fn collect_target_regs(
+    mut read: impl FnMut(u32) -> Result<u32>,
+    db: &[ChipDef],
+) -> (HashMap<u32, Vec<u32>>, Option<u16>, Option<ResolvedChip>) {
     let mut regs: HashMap<u32, Vec<u32>> = HashMap::new();
-    if let Ok(cpuid) = link.read_debug_reg(0xE000ED00) {
+    if let Ok(cpuid) = read(0xE000ED00) {
         regs.insert(0xE000ED00, vec![cpuid]);
     }
     // DBGMCU_IDCODE: 0xE0042000 on Cortex-M3/M4/M7 STM32, 0x40015800 on M0.
     let mut idcode = None;
     for &addr in &[0xE0042000u32, 0x40015800u32] {
-        if let Ok(v) = link.read_debug_reg(addr) {
+        if let Ok(v) = read(addr) {
             if (v & 0xFFF) != 0 && (v & 0xFFF) != 0xFFF {
                 regs.insert(0xE0042000, vec![v]);
                 idcode = Some(v);
@@ -3525,17 +3569,17 @@ fn stlink_read_regs(
     let resolved = dev_id.and_then(|d| resolve_chip(d, db));
     if let Some(r) = resolved.as_ref() {
         // Flash size is a 16-bit field that may be non-word-aligned (0x1FFF7A22
-        // on F4/F7); READDEBUGREG only reads aligned words, so read the
-        // containing word and keep the correct half in the low 16 bits.
+        // on F4/F7); 32-bit reads are word-aligned, so read the containing word
+        // and keep the correct half in the low 16 bits.
         if let Some(fsa) = r.flash_size_addr {
-            if let Ok(word) = link.read_debug_reg(fsa & !0x3) {
+            if let Ok(word) = read(fsa & !0x3) {
                 regs.insert(fsa, vec![(word >> ((fsa & 0x3) * 8)) & 0xFFFF]);
             }
         }
         if let Some(uid_addr) = r.uid_addr {
             let mut uid = Vec::new();
             for k in 0..3 {
-                match link.read_debug_reg(uid_addr + k * 4) {
+                match read(uid_addr + k * 4) {
                     Ok(v) => uid.push(v),
                     Err(_) => break,
                 }
@@ -3545,7 +3589,7 @@ fn stlink_read_regs(
             }
         }
         if let Some(rdp_addr) = r.rdp_addr {
-            if let Ok(v) = link.read_debug_reg(rdp_addr) {
+            if let Ok(v) = read(rdp_addr) {
                 regs.insert(rdp_addr, vec![v]);
             }
         }
@@ -3614,6 +3658,302 @@ fn swd_no_target_hint(link: &mut StlinkLink) -> String {
          NRST not held low; using the SWD (not JTAG) header. On a Nucleo driven by an EXTERNAL ST-Link, remove the two \
          CN2 (ST-LINK) jumpers to disconnect the on-board ST-Link, and power the board (USB or E5V)."
     )
+}
+
+// ============================================================================
+// Native CMSIS-DAP v2 reader (RP2040 Debug Probe / picoprobe — layer 2)
+//
+// Speaks the CMSIS-DAP v2 bulk protocol directly over nusb to read the
+// downstream SWD target's identity read-only (DPIDR, then CPUID / DBGMCU /
+// flash / UID / RDP via the MEM-AP). No probe-rs/pyocd. Brings up SWD and reads
+// ID registers only — no halt, reset, erase, or write. The DAP_Transfer request
+// byte is APnDP(bit0) | RnW(bit1) | (regaddr & 0x0C); reads pull the result on
+// the next transfer (DRW then RDBUFF), per the SWD posted-read pipeline.
+// ============================================================================
+
+const DAP_CONNECT: u8 = 0x02;
+const DAP_TRANSFER_CONFIGURE: u8 = 0x04;
+const DAP_TRANSFER: u8 = 0x05;
+const DAP_SWJ_CLOCK: u8 = 0x11;
+const DAP_SWJ_SEQUENCE: u8 = 0x12;
+const DAP_SWD_CONFIGURE: u8 = 0x13;
+
+struct CmsisDapLink {
+    _device: nusb::Device,
+    _iface: nusb::Interface,
+    ep_out: Endpoint<Bulk, Out>,
+    ep_in: Endpoint<Bulk, In>,
+}
+
+impl CmsisDapLink {
+    /// Open the probe's CMSIS-DAP v2 vendor interface and its bulk endpoints.
+    fn open_device(probe: &nusb::DeviceInfo) -> Result<Self> {
+        // Prefer the vendor interface whose string names CMSIS-DAP (the v2 one
+        // with bulk endpoints); fall back to the first vendor (0xFF) interface.
+        let iface_num = probe
+            .interfaces()
+            .find(|i| {
+                i.class() == 0xff
+                    && i.interface_string()
+                        .is_some_and(|s| s.to_ascii_uppercase().contains("CMSIS-DAP"))
+            })
+            .or_else(|| probe.interfaces().find(|i| i.class() == 0xff))
+            .map(|i| i.interface_number())
+            .context("no CMSIS-DAP vendor interface found")?;
+
+        let device = probe.open().wait().context("open USB device")?;
+        let iface = device
+            .claim_interface(iface_num)
+            .wait()
+            .with_context(|| format!("claim CMSIS-DAP interface MI_{iface_num:02} (needs WinUSB on Windows)"))?;
+
+        let config = device.active_configuration().context("read active configuration")?;
+        let alt = config
+            .interface_alt_settings()
+            .find(|a| a.interface_number() == iface_num && a.alternate_setting() == 0)
+            .context("interface alt setting 0 not found")?;
+        // The CMSIS-DAP v2 interface carries only bulk endpoints (OUT, IN, and
+        // optionally a SWO IN). Take the first OUT and first IN by address.
+        let mut ep_out_addr = None;
+        let mut ep_in_addr = None;
+        for ep in alt.endpoints() {
+            let a = ep.address();
+            if a & 0x80 == 0 {
+                ep_out_addr.get_or_insert(a);
+            } else {
+                ep_in_addr.get_or_insert(a);
+            }
+        }
+        let ep_out_addr = ep_out_addr.context("no bulk OUT endpoint")?;
+        let ep_in_addr = ep_in_addr.context("no bulk IN endpoint")?;
+        let out = iface
+            .endpoint::<Bulk, Out>(ep_out_addr)
+            .map_err(|e| anyhow::anyhow!("open OUT endpoint 0x{ep_out_addr:02x}: {e}"))?;
+        let inp = iface
+            .endpoint::<Bulk, In>(ep_in_addr)
+            .map_err(|e| anyhow::anyhow!("open IN endpoint 0x{ep_in_addr:02x}: {e}"))?;
+        Ok(Self { _device: device, _iface: iface, ep_out: out, ep_in: inp })
+    }
+
+    /// Send a CMSIS-DAP v2 command (raw bytes, no report id) and read the reply.
+    /// Validates the echoed command id in byte 0.
+    fn command(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let timeout = std::time::Duration::from_millis(1000);
+        self.ep_out
+            .transfer_blocking(Buffer::from(payload.to_vec()), timeout)
+            .into_result()
+            .map_err(|e| anyhow::anyhow!("DAP OUT failed: {e}"))?;
+        let resp = self
+            .ep_in
+            .transfer_blocking(Buffer::new(64), timeout)
+            .into_result()
+            .map_err(|e| anyhow::anyhow!("DAP IN failed: {e}"))?
+            .into_vec();
+        if resp.first().copied() != payload.first().copied() {
+            anyhow::bail!(
+                "DAP response id 0x{:02X} != command 0x{:02X}",
+                resp.first().copied().unwrap_or(0),
+                payload.first().copied().unwrap_or(0)
+            );
+        }
+        Ok(resp)
+    }
+
+    fn connect_swd(&mut self) -> Result<()> {
+        let r = self.command(&[DAP_CONNECT, 0x01])?;
+        if r.get(1).copied() != Some(0x01) {
+            anyhow::bail!("DAP_Connect SWD not accepted (resp {:?})", r.get(1));
+        }
+        Ok(())
+    }
+
+    fn swj_clock(&mut self, hz: u32) -> Result<()> {
+        let b = hz.to_le_bytes();
+        self.command(&[DAP_SWJ_CLOCK, b[0], b[1], b[2], b[3]])?;
+        Ok(())
+    }
+
+    fn swj_sequence(&mut self, bits: u8, data: &[u8]) -> Result<()> {
+        let mut payload = vec![DAP_SWJ_SEQUENCE, bits];
+        payload.extend_from_slice(data);
+        self.command(&payload)?;
+        Ok(())
+    }
+
+    /// SWD line reset + JTAG-to-SWD switch + line reset + idle. Read-only.
+    fn line_reset_and_switch(&mut self) -> Result<()> {
+        self.swj_sequence(51, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07])?; // >=50 clocks high
+        self.swj_sequence(16, &[0x9E, 0xE7])?; // JTAG-to-SWD magic 0xE79E
+        self.swj_sequence(51, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07])?; // line reset
+        self.swj_sequence(8, &[0x00])?; // idle
+        Ok(())
+    }
+
+    /// One single-word DAP_Transfer. `req` is the request byte; `write` carries
+    /// data for writes. Returns the 32-bit value for reads.
+    fn transfer(&mut self, req: u8, write: Option<u32>) -> Result<u32> {
+        let mut payload = vec![DAP_TRANSFER, 0x00, 0x01, req]; // DAP index 0, count 1
+        if let Some(v) = write {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let resp = self.command(&payload)?;
+        let count = resp.get(1).copied().unwrap_or(0);
+        let ack = resp.get(2).copied().unwrap_or(0) & 0x07;
+        if count != 1 || ack != 1 {
+            anyhow::bail!("DAP_Transfer ack 0x{ack:02X} (count {count})");
+        }
+        if write.is_some() {
+            Ok(0)
+        } else {
+            le_u32(&resp, 3).context("short DAP_Transfer read")
+        }
+    }
+
+    fn dp_read(&mut self, addr: u8) -> Result<u32> {
+        self.transfer(0x02 | (addr & 0x0C), None)
+    }
+    fn dp_write(&mut self, addr: u8, v: u32) -> Result<u32> {
+        self.transfer(addr & 0x0C, Some(v))
+    }
+    fn ap_read(&mut self, addr: u8) -> Result<u32> {
+        self.transfer(0x03 | (addr & 0x0C), None)
+    }
+    fn ap_write(&mut self, addr: u8, v: u32) -> Result<u32> {
+        self.transfer(0x01 | (addr & 0x0C), Some(v))
+    }
+
+    /// Bring up SWD and return the DP IDCODE (proves a target is present).
+    fn bringup(&mut self) -> Result<u32> {
+        self.connect_swd()?;
+        self.swj_clock(1_000_000)?;
+        self.command(&[DAP_SWD_CONFIGURE, 0x00])?;
+        self.command(&[DAP_TRANSFER_CONFIGURE, 0x00, 0x00, 0x00, 0x00, 0x00])?;
+        self.line_reset_and_switch()?;
+        let dpidr = self.dp_read(0x0)?; // first DP access after reset reads DPIDR
+        let _ = self.dp_write(0x0, 0x1E); // ABORT: clear sticky error flags
+        Ok(dpidr)
+    }
+
+    /// Power up the debug/system domains and select AP0 for 32-bit MEM-AP reads.
+    fn open_mem_ap(&mut self) -> Result<()> {
+        self.dp_write(0x4, 0x5000_0000)?; // CTRL/STAT: CSYSPWRUPREQ | CDBGPWRUPREQ
+        let mut ok = false;
+        for _ in 0..50 {
+            if self.dp_read(0x4)? & 0xA000_0000 == 0xA000_0000 {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            anyhow::bail!("DP power-up not acknowledged");
+        }
+        self.dp_write(0x8, 0x0000_0000)?; // SELECT: AP 0, bank 0
+        self.ap_write(0x0, 0x2300_0052)?; // CSW: 32-bit, debug enable
+        Ok(())
+    }
+
+    /// Read one 32-bit word from the target's memory map (read-only). The SWD
+    /// AP read is posted, so the value is pulled from RDBUFF afterwards.
+    fn read_mem32(&mut self, addr: u32) -> Result<u32> {
+        self.ap_write(0x4, addr)?; // TAR
+        let _ = self.ap_read(0xC)?; // DRW (posted; stale)
+        self.dp_read(0xC) // RDBUFF (actual value)
+    }
+}
+
+/// Layer 1: identify an RP2040-based CMSIS-DAP debug probe from VID:PID + USB
+/// descriptors (no SWD command issued). Keys match `print_stlink_controller_info`.
+fn run_cmsisdap_controller_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    let mut info = HashMap::new();
+    let generation = match pid {
+        0x000c => "Raspberry Pi Debug Probe (debugprobe firmware)",
+        0x0004 => "picoprobe (Pico-as-probe firmware)",
+        _ => "RP2040 CMSIS-DAP probe",
+    };
+    for (k, v) in [
+        ("Layer", "1 - USB debug probe (CMSIS-DAP)"),
+        ("Generation", generation),
+        ("Controller MCU", "RP2040 (dual Arm Cortex-M0+)"),
+        ("Core", "2x Arm Cortex-M0+"),
+        ("Architecture", "Armv6-M, Thumb/Thumb-2 subset"),
+        ("Max clock", "133 MHz"),
+        ("Flash", "External QSPI (e.g. 2 MB on a Pico)"),
+        ("SRAM", "264 KB"),
+        ("Upstream", "USB 2.0 Full Speed (CMSIS-DAP v2 bulk + CDC UART)"),
+        ("Downstream", "SWD (+ UART bridge)"),
+    ] {
+        info.insert(k.to_string(), v.to_string());
+    }
+    info.insert("USB identity".into(), format!("{vid:04x}:{pid:04x}"));
+    if let Some(dev) = nusb::list_devices()
+        .wait()
+        .ok()
+        .and_then(|mut it| it.find(|d| d.vendor_id() == vid && d.product_id() == pid))
+    {
+        info.insert("Descriptor access".into(), "Available through nusb".into());
+        if let Some(p) = dev.product_string() {
+            info.insert("USB product".into(), p.to_string());
+        }
+        if let Some(s) = dev.serial_number() {
+            info.insert("USB serial".into(), s.to_string());
+        }
+    }
+    info.insert("Identification".into(), "VID:PID identifies an RP2040 CMSIS-DAP probe".into());
+    info.insert("Layer 2".into(), "Auto-probed read-only below (native CMSIS-DAP)".into());
+    Ok(info)
+}
+
+/// Layer 2: read the downstream SWD target through the CMSIS-DAP probe natively.
+/// Returns keys for `print_stlink_target_info`; auto-detects target presence.
+fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+    let mut info = HashMap::new();
+    let probe = nusb::list_devices()
+        .wait()
+        .ok()
+        .and_then(|mut it| it.find(|d| d.vendor_id() == vid && d.product_id() == pid));
+    let Some(probe) = probe else {
+        info.insert("Layer 2".into(), "SKIP - CMSIS-DAP USB device not found".into());
+        return Ok(info);
+    };
+
+    let mut link = match CmsisDapLink::open_device(&probe) {
+        Ok(l) => l,
+        Err(e) => {
+            info.insert("Layer 2".into(), format!("SKIP - cannot open CMSIS-DAP interface: {e}"));
+            #[cfg(windows)]
+            info.insert(
+                "Fix".into(),
+                "bind WinUSB to the 'CMSIS-DAP v2' interface with Zadig (usbipd-rs --install zadig)".into(),
+            );
+            return Ok(info);
+        }
+    };
+    info.insert("Probe".into(), "CMSIS-DAP v2 (native nusb)".into());
+
+    match link.bringup() {
+        Ok(dpidr) => {
+            info.insert("DP IDCODE".into(), format!("0x{dpidr:08X}"));
+        }
+        Err(e) => {
+            info.insert("Layer 2".into(), format!("none - SWD bring-up failed: {e}"));
+            info.insert(
+                "Hint".into(),
+                "CMSIS-DAP probe present but no target answered. Check: target powered; SWDIO/SWCLK/GND wired to the probe; correct SWD pins; NRST not held low.".into(),
+            );
+            return Ok(info);
+        }
+    }
+    if let Err(e) = link.open_mem_ap() {
+        info.insert("Layer 2".into(), format!("partial - DP up but MEM-AP failed: {e}"));
+        return Ok(info);
+    }
+
+    let db = load_chip_db();
+    let (regs, dev_id, resolved) = collect_target_regs(|addr| link.read_mem32(addr), &db);
+    for (k, v) in format_target_rows(&regs, dev_id, resolved.as_ref()) {
+        info.insert(k.to_string(), v);
+    }
+    Ok(info)
 }
 
 fn cmd_mcu_alive_native() -> Result<()> {

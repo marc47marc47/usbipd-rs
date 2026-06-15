@@ -90,7 +90,8 @@ downstream SWD/JTAG target is deliberately left untouched:
 | `2E8A:0003`               | RP2040 BOOTSEL (Pi Pico)             | `picotool`                  |
 | `2E8A:000F`               | RP2350 BOOTSEL (Pi Pico 2)           | `picotool`                  |
 | `0D28:0204`               | mbed CMSIS-DAP (BBC micro:bit, FRDM) | `DETAILS.TXT` + `pyocd`     |
-| `0483:3748` / `374B` / `374E` / `374F` | ST-Link V2 / V2-1 / V3 controller | `nusb` layer-1 architecture only |
+| `2E8A:000C` / `0004`      | RPi Debug Probe / picoprobe (RP2040) | RP2040 layer 1 + native CMSIS-DAP SWD layer 2 |
+| `0483:3748` / `374B` / `374E` / `374F` | ST-Link V2 / V2-1 / V3 controller | STM32 layer 1 + native ST-Link SWD layer 2 |
 
 `usbipd-rs --probe` automatically performs the ST-Link layer-2 read when an
 ST-Link is present: after the layer-1 controller info it opens SWD natively and,
@@ -218,6 +219,13 @@ Step 7 - target identity (read-only):
   Read protection:   Disabled — flash readable (RDP Level 0)
   Source:            etc/chips/F446.chip
 ```
+
+The same two-layer, read-only model also covers **CMSIS-DAP debug probes** —
+notably the RP2040-based Raspberry Pi Debug Probe / picoprobe (`2E8A:000C` /
+`0004`). Layer 1 identifies the RP2040 probe itself; layer 2 brings up SWD and
+reads the downstream target natively over the **CMSIS-DAP v2 bulk protocol**
+(`nusb`, no probe-rs/pyocd). On Windows the probe's "CMSIS-DAP v2" interface
+must be bound to WinUSB (use Zadig via `usbipd-rs --install zadig`).
 
 STM32 models are recognized from a **built-in family table** (no files needed).
 For portability the whole table is compiled in; to add or override a part

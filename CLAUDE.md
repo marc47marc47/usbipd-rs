@@ -52,6 +52,13 @@ two largely independent subsystems.
   automatically under `--probe` (no separate flag) and auto-detects target
   presence — when nothing answers it returns a one-layer result. There is no
   `--probe-layer2`.
+- RP2040 CMSIS-DAP debug probes (RPi Debug Probe `2e8a:000c`, picoprobe
+  `2e8a:0004`) use `[CmsisDap, CmsisDapTarget]` — the same two-layer model over
+  a different wire protocol. `CmsisDapLink` speaks CMSIS-DAP v2 (bulk) natively:
+  `bringup()` connects SWD + line-reset + reads DPIDR; `open_mem_ap()` powers up
+  the DP and selects AP0; `read_mem32()` does TAR/DRW/RDBUFF. The DAP_Transfer
+  request byte is `APnDP | (RnW<<1) | (regaddr & 0x0C)`. Layer-2 register
+  collection is shared with ST-Link via `collect_target_regs(read_fn, db)`.
 
 ### 2. Tool installer (`--install`, `--list-tools`)
 
@@ -111,6 +118,9 @@ two largely independent subsystems.
   its `run_*`/`print_*` functions and the match arm in `probe_boards()`.
 - **New installable tool:** add a `ToolSpec` to `TOOLS` (it then appears
   automatically in `--list-tools`).
+- **New debug probe:** add a `KnownBoard` with `STLINK` (ST-Link bulk) or
+  `CMSISDAP` (CMSIS-DAP v2) probes. Both feed the shared `collect_target_regs` /
+  `format_target_rows` layer-2 pipeline, so the downstream STM32 decode is reused.
 - **New STM32 model (native reader):** add a `dev_id` arm to `stm_family()`
   (and `builtin_sram_kb`) for a compiled-in entry, OR drop a `etc/chips/*.chip`
   file to add/override one without recompiling. Keep `etc/chips/*.chip`
