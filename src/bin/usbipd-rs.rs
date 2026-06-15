@@ -3678,6 +3678,13 @@ const DAP_SWJ_CLOCK: u8 = 0x11;
 const DAP_SWJ_SEQUENCE: u8 = 0x12;
 const DAP_SWD_CONFIGURE: u8 = 0x13;
 
+// RP2040 is a SWD multidrop (DPv2) target with two cores. TARGETSEL for core 0;
+// SYSINFO CHIP_ID/GITREF identify the chip + stepping over the MEM-AP.
+const RP2040_TARGETSEL_CORE0: u32 = 0x01002927;
+const RP2040_TARGETSEL_CORE1: u32 = 0x11002927;
+const RP2040_SYSINFO_CHIP_ID: u32 = 0x40000000;
+const RP2040_SYSINFO_GITREF: u32 = 0x40000008;
+
 struct CmsisDapLink {
     _device: nusb::Device,
     _iface: nusb::Interface,
@@ -3822,16 +3829,53 @@ impl CmsisDapLink {
         self.transfer(0x01 | (addr & 0x0C), Some(v))
     }
 
-    /// Bring up SWD and return the DP IDCODE (proves a target is present).
-    fn bringup(&mut self) -> Result<u32> {
+    /// ARM dormant-to-SWD "selection alert" sequence, then a line reset. DPv2
+    /// targets (RP2040) may power up dormant and need this before they listen.
+    /// All raw SWJ bit sequences — no DP access, no reset/halt of the core.
+    fn dormant_to_swd(&mut self) -> Result<()> {
+        self.swj_sequence(8, &[0xFF])?; // >=8 cycles high: abort any pending alert
+        self.swj_sequence(64, &[0x92, 0xF3, 0x09, 0x62, 0x95, 0x2D, 0x85, 0x86])?; // alert [0:63]
+        self.swj_sequence(64, &[0xE9, 0xAF, 0xDD, 0xE3, 0xA2, 0x0E, 0xBC, 0x19])?; // alert [64:127]
+        self.swj_sequence(12, &[0xA0, 0x01])?; // 4 low cycles + 8-bit SWD activation code 0x1A
+        self.swj_sequence(51, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07])?; // line reset
+        self.swj_sequence(3, &[0x00])?; // idle
+        Ok(())
+    }
+
+    /// SWD multidrop TARGETSEL write, bit-banged as a raw SWD write packet via
+    /// DAP_SWJ_Sequence (header + 32-bit data + parity). TARGETSEL gets no ACK,
+    /// so issuing it as a raw sequence sidesteps the DAP_Transfer ACK check.
+    fn write_targetsel(&mut self, targetsel: u32) -> Result<()> {
+        let parity = (targetsel.count_ones() % 2) as u64;
+        let data = (parity << 45) | ((targetsel as u64) << 13) | 0x1f99;
+        self.swj_sequence(48, &data.to_le_bytes()[..6])
+    }
+
+    /// Bring up SWD and return `(DPIDR, multidrop)`. Tries single-drop first
+    /// (STM32 etc.); if the DP doesn't answer, runs the dormant-to-SWD + RP2040
+    /// core-0 TARGETSEL multidrop sequence (RP2040 has two DPs on the bus).
+    fn bringup(&mut self) -> Result<(u32, bool)> {
         self.connect_swd()?;
         self.swj_clock(1_000_000)?;
         self.command(&[DAP_SWD_CONFIGURE, 0x00])?;
         self.command(&[DAP_TRANSFER_CONFIGURE, 0x00, 0x00, 0x00, 0x00, 0x00])?;
+
         self.line_reset_and_switch()?;
-        let dpidr = self.dp_read(0x0)?; // first DP access after reset reads DPIDR
-        let _ = self.dp_write(0x0, 0x1E); // ABORT: clear sticky error flags
-        Ok(dpidr)
+        if let Ok(dpidr) = self.dp_read(0x0) {
+            let _ = self.dp_write(0x0, 0x1E); // ABORT: clear sticky error flags
+            return Ok((dpidr, false));
+        }
+
+        // Multidrop (RP2040 etc.): dormant->SWD, then try each core's TARGETSEL.
+        for &targetsel in &[RP2040_TARGETSEL_CORE0, RP2040_TARGETSEL_CORE1] {
+            self.dormant_to_swd()?;
+            self.write_targetsel(targetsel)?;
+            if let Ok(dpidr) = self.dp_read(0x0) {
+                let _ = self.dp_write(0x0, 0x1E); // clear ABORT sticky (ORUNERR after reset)
+                return Ok((dpidr, true));
+            }
+        }
+        anyhow::bail!("no SWD target answered (single-drop and RP2040 multidrop both failed)")
     }
 
     /// Power up the debug/system domains and select AP0 for 32-bit MEM-AP reads.
@@ -3930,9 +3974,10 @@ fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<String, Strin
     };
     info.insert("Probe".into(), "CMSIS-DAP v2 (native nusb)".into());
 
-    match link.bringup() {
-        Ok(dpidr) => {
-            info.insert("DP IDCODE".into(), format!("0x{dpidr:08X}"));
+    let multidrop = match link.bringup() {
+        Ok((dpidr, multidrop)) => {
+            info.insert("DP IDCODE".into(), format!("0x{dpidr:08X}{}", if multidrop { " (SWD multidrop)" } else { "" }));
+            multidrop
         }
         Err(e) => {
             info.insert("Layer 2".into(), format!("none - SWD bring-up failed: {e}"));
@@ -3942,10 +3987,21 @@ fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<String, Strin
             );
             return Ok(info);
         }
-    }
+    };
     if let Err(e) = link.open_mem_ap() {
         info.insert("Layer 2".into(), format!("partial - DP up but MEM-AP failed: {e}"));
         return Ok(info);
+    }
+
+    // RP2040 (and other SWD-multidrop parts) aren't STM32: identify via the
+    // RP2040 SYSINFO CHIP_ID before falling back to the STM32 DBGMCU decode.
+    if let Ok(chip_id) = link.read_mem32(RP2040_SYSINFO_CHIP_ID) {
+        if chip_id & 0xFFF == 0x927 {
+            for (k, v) in rp2040_rows(&mut link, chip_id, multidrop) {
+                info.insert(k.to_string(), v);
+            }
+            return Ok(info);
+        }
     }
 
     let db = load_chip_db();
@@ -3954,6 +4010,34 @@ fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<String, Strin
         info.insert(k.to_string(), v);
     }
     Ok(info)
+}
+
+/// Format an RP2040 downstream target's read-only identity from its SYSINFO
+/// CHIP_ID (manufacturer 0x927, part 0x0002) + GITREF + CPUID.
+fn rp2040_rows(link: &mut CmsisDapLink, chip_id: u32, multidrop: bool) -> Vec<(&'static str, String)> {
+    let part = (chip_id >> 12) & 0xFFFF;
+    let revision = (chip_id >> 28) & 0xF;
+    let name = if part == 0x0002 { "RP2040" } else { "Raspberry Pi silicon" };
+    let stepping = match (part, revision) {
+        (0x0002, 1) => " (B0/B1)",
+        (0x0002, 2) => " (B2)",
+        _ => "",
+    };
+    let mut rows = vec![
+        ("Device ID", format!("{name}{stepping} — Raspberry Pi (mfr 0x927, part 0x{part:04X})")),
+        ("Revision", format!("0x{revision:X}")),
+    ];
+    if let Ok(cpuid) = link.read_mem32(0xE000ED00) {
+        rows.push(("Core", format!("{} (dual-core; core 0 selected)", cortex_core(cpuid))));
+    }
+    if let Ok(gitref) = link.read_mem32(RP2040_SYSINFO_GITREF) {
+        rows.push(("Identification", format!("bootrom GITREF 0x{gitref:08X}, CHIP_ID 0x{chip_id:08X}")));
+    }
+    rows.push(("Flash", "External QSPI (size not read over SWD)".to_string()));
+    rows.push(("SRAM", "264 KB".to_string()));
+    rows.push(("Transport", format!("SWD{} (native CMSIS-DAP, read-only)", if multidrop { " multidrop" } else { "" })));
+    rows.push(("Access", "Read-only identity registers".to_string()));
+    rows
 }
 
 fn cmd_mcu_alive_native() -> Result<()> {
