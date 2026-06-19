@@ -3933,8 +3933,47 @@ impl CmsisDapLink {
     /// single CMSIS-DAP transfer the firmware completes the posted AP read and
     /// returns the data directly, so use the DRW read result.
     fn read_mem32(&mut self, addr: u32) -> Result<u32> {
-        self.ap_write(0x4, addr)?; // TAR
-        self.ap_read(0xC) // DRW — data returned by the probe
+        // A MEM-AP read of a slow region (e.g. STM32 DBGMCU, an APB register
+        // behind the AHB bridge) often answers WAIT on the first try and OK on a
+        // retry; a real bus error latches a sticky flag we must clear via ABORT
+        // before retrying. Loop a few times covering both cases.
+        let mut last = anyhow::anyhow!("MEM-AP read 0x{addr:08X}: not attempted");
+        for attempt in 0..8 {
+            match self.read_mem32_once(addr) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    last = e;
+                    if attempt > 0 {
+                        let _ = self.dp_write(0x0, 0x1E); // clear sticky (STK*CLR)
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// One MEM-AP word read issued as a SINGLE DAP_Transfer of three sub-transfers
+    /// (TAR write, posted DRW read, DP RDBUFF read). Batching them in one request
+    /// runs them back-to-back on the SWD bus with no inter-transfer USB gap, which
+    /// matches what OpenOCD/probe-rs do — splitting the posted read across separate
+    /// DAP_Transfer commands desyncs some CMSIS-DAP firmwares (RP2040 debugprobe).
+    fn read_mem32_once(&mut self, addr: u32) -> Result<u32> {
+        let a = addr.to_le_bytes();
+        let payload = [
+            DAP_TRANSFER, 0x00, 0x03, // DAP index 0, 3 transfers
+            0x05, a[0], a[1], a[2], a[3], // AP write TAR = addr
+            0x0F, // AP read DRW (posted)
+            0x0E, // DP read RDBUFF (real data for the posted read)
+        ];
+        let resp = self.command(&payload)?;
+        let count = resp.get(1).copied().unwrap_or(0);
+        let ack = resp.get(2).copied().unwrap_or(0) & 0x07;
+        if count != 3 || ack != 1 {
+            anyhow::bail!("MEM-AP read 0x{addr:08X}: count {count} ack 0x{ack:02X}");
+        }
+        // Two read transfers → 8 data bytes after the 3-byte header. The RDBUFF
+        // word (offset 7) is the real value; the DRW word (offset 3) is stale.
+        le_u32(&resp, 7).context("short MEM-AP read response")
     }
 }
 

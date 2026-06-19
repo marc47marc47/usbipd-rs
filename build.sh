@@ -32,7 +32,7 @@ version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 
 echo ">> usbipd-rs $version"
 echo ">> cargo build --release ${target_args[*]-}  (RUSTFLAGS='$RUSTFLAGS')"
-cargo build --release "${target_args[@]}"
+cargo build --release ${target_args[@]+"${target_args[@]}"}
 
 # Report where the binary landed.
 if [ "${#target_args[@]}" -gt 0 ]; then

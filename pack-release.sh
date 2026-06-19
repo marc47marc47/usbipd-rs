@@ -7,6 +7,7 @@
 #      dist/  (zip on Windows, tar.gz on macOS/Linux) — same layout the CI
 #      release uses, so the local artifact matches a published one.
 #   3. Install the binary into ~/.local/bin, overwriting any older copy there.
+#      On macOS, also copy it into ~/.cargo/bin (typically already on PATH).
 #
 # This is the LOCAL counterpart to the tag-triggered GitHub release: use it to
 # put a freshly built usbipd-rs on your own PATH without cutting a real release.
@@ -91,3 +92,13 @@ case ":$PATH:" in
   *":$dest:"*) ;;
   *) echo "note: $dest is not on your PATH — add it to use 'usbipd-rs' directly." >&2 ;;
 esac
+
+# On macOS, also drop a copy into ~/.cargo/bin (usually already on PATH for
+# Rust users), so `usbipd-rs` is runnable without touching ~/.local/bin.
+if [ "$os" = macos ]; then
+  cargo_dest="${CARGO_HOME:-$HOME/.cargo}/bin"
+  mkdir -p "$cargo_dest"
+  cp -f "$src" "$cargo_dest/$bin"
+  chmod +x "$cargo_dest/$bin" 2>/dev/null || true
+  echo "Installed: $cargo_dest/$bin  (usbipd-rs $version)"
+fi
