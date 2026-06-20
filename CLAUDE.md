@@ -59,6 +59,14 @@ two largely independent subsystems.
   the DP and selects AP0; `read_mem32()` does TAR/DRW/RDBUFF. The DAP_Transfer
   request byte is `APnDP | (RnW<<1) | (regaddr & 0x0C)`. Layer-2 register
   collection is shared with ST-Link via `collect_target_regs(read_fn, db)`.
+- The CMSIS-DAP probe also reads a **single-drop STM32 target** (e.g. an
+  STM32F103 "Blue Pill" wired to the probe's SWD pins): `bringup()` tries the
+  RP2040 multidrop sequence first and accepts it **only on an exact RP2040
+  DPIDR** (`RP2040_DPIDR = 0x0BC12477`), otherwise falls back to the DPv1
+  line-reset + JTAG-to-SWD switch and routes the result through the same
+  `collect_target_regs` → `format_target_rows` STM32 decode as the ST-Link path.
+  A version-only multidrop test is deliberately avoided — a contended bus or an
+  STM32 that ignores TARGETSEL can fake a DPv2 version field.
 
 ### 2. Tool installer (`--install`, `--list-tools`)
 
@@ -110,6 +118,14 @@ two largely independent subsystems.
   over the built-in table, keeping the verified UID/RDP addresses from built-in.
   `cortex_core()` / `decode_rdp()` are shared with the pyocd path's
   `decode_stlink_regs()`.
+- Clone detection: STM32-compatible parts (GigaDevice GD32, CKS, APM32,
+  MindMotion) mirror ST's DBGMCU DEV_ID, so the family name alone can't tell
+  them apart. `stm32_known_revs(dev_id)` lists ST's published REV_IDs for the
+  often-cloned F1 families; when a known DEV_ID reports a REV_ID outside that
+  set (e.g. a GD32F103RET6 reads DEV_ID `0x414` like ST's high-density F103 but
+  REV_ID `0x1309`), `decode_stlink_regs()` adds a `Vendor:` row flagging it as a
+  likely clone. The genuine-vs-clone call is read-only and heuristic — it never
+  changes the reported DEV_ID/family.
 
 ## Extending
 

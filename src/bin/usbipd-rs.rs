@@ -1984,6 +1984,84 @@ fn stm_family(dev_id: u16) -> Option<StmFamily> {
     Some(StmFamily { name, flash_size_addr, uid_addr, rdp_addr, rdp_kind })
 }
 
+/// Documented genuine-ST silicon REV_IDs (DBGMCU IDCODE bits [31:16]) for the
+/// families most often cloned. STM32-compatible parts from GigaDevice (GD32),
+/// CKS, APM32 (Geehy), MindMotion, etc. mirror ST's DEV_ID but report a REV_ID
+/// outside ST's published set — so a known DEV_ID with an unknown REV_ID is a
+/// strong "not genuine ST" signal. Returns `None` for families we don't track
+/// closely enough to second-guess (then we make no clone claim).
+fn stm32_known_revs(dev_id: u16) -> Option<&'static [u16]> {
+    Some(match dev_id {
+        0x412 => &[0x1000],                          // F1 low-density
+        0x410 => &[0x0000, 0x2000, 0x2001, 0x2003],  // F1 medium-density
+        0x414 => &[0x1000, 0x1001, 0x1003],          // F1 high-density
+        0x418 => &[0x1000, 0x1001],                  // F1 connectivity line
+        0x420 => &[0x1000, 0x1001],                  // F100 value line, MD
+        0x428 => &[0x1000, 0x1001],                  // F100 value line, HD
+        0x430 => &[0x1000],                          // F1 XL-density
+        _ => return None,
+    })
+}
+
+/// GigaDevice GD32 lines that mirror an ST DBGMCU DEV_ID (so they would decode
+/// as STM32 by IDCODE alone). Keyed by the mirrored DEV_ID → (family, core, max
+/// MHz). GD32 reports the SAME DEV_ID as the ST part it replaces, but a REV_ID
+/// outside ST's published set (see `stm32_known_revs`) and a faster top clock
+/// (108 MHz on the F1 line vs ST's 72 MHz). The package/pin letter (C=48, R=64,
+/// V=100, Z=144) and temperature grade are NOT exposed over SWD, so the density
+/// from the flash-size word is the finest model the silicon will tell us.
+const GD32_FAMILIES: &[(u16, &str, &str, u16)] = &[
+    (0x410, "GD32F103", "Cortex-M3", 108), // medium-density mirror (≤128 KB)
+    (0x414, "GD32F103", "Cortex-M3", 108), // high-density mirror (256–512 KB)
+    (0x418, "GD32F105", "Cortex-M3", 108), // connectivity-line mirror
+    (0x430, "GD32F103", "Cortex-M3", 108), // XL-density mirror
+];
+
+/// Density letter for a GD32F10x from its flash size in KB (x4=16 … xE=512).
+fn gd32_density(flash_kb: Option<u32>) -> &'static str {
+    match flash_kb {
+        Some(k) if k >= 512 => "xE",
+        Some(k) if k >= 384 => "xD",
+        Some(k) if k >= 256 => "xC",
+        Some(k) if k >= 128 => "xB",
+        Some(k) if k >= 64 => "x8",
+        Some(k) if k >= 32 => "x6",
+        Some(k) if k >= 16 => "x4",
+        _ => "",
+    }
+}
+
+/// Resolve a GigaDevice GD32 model from the read-only signals: a known ST DEV_ID
+/// reporting a non-ST REV_ID (the clone signature) selects the family, and the
+/// flash size selects the density. Returns `(display_name, core, max_mhz)`, or
+/// `None` when this isn't a recognized GD32 (then the STM32 name/clone-flag path
+/// runs). The canonical 64-pin part is cited as an example for the F103 line;
+/// the exact package can't be read over SWD.
+fn gd32_identify(dev_id: u16, rev_id: u16, flash_kb: Option<u32>) -> Option<(String, &'static str, u16)> {
+    // Must look like a clone first: ST DEV_ID we know, REV_ID ST never shipped.
+    match stm32_known_revs(dev_id) {
+        Some(revs) if !revs.contains(&rev_id) => {}
+        _ => return None,
+    }
+    let &(_, family, core, max_mhz) = GD32_FAMILIES.iter().find(|&&(id, ..)| id == dev_id)?;
+    let density = gd32_density(flash_kb);
+    let example = if family == "GD32F103" {
+        match density {
+            "xE" => " — e.g. GD32F103RET6 (64-pin, 512 KB)",
+            "xD" => " — e.g. GD32F103RDT6 (384 KB)",
+            "xC" => " — e.g. GD32F103RCT6 (256 KB)",
+            "xB" => " — e.g. GD32F103CBT6 (128 KB)",
+            "x8" => " — e.g. GD32F103C8T6 (64 KB)",
+            "x6" => " — e.g. GD32F103C6T6 (32 KB)",
+            "x4" => " — e.g. GD32F103C4T6 (16 KB)",
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    Some((format!("{family}{density} (GigaDevice){example} — {core}"), core, max_mhz))
+}
+
 /// What the ST-Link debug interface's WinUSB binding looks like on Windows.
 enum StlinkDriver {
     /// Bound to WinUSB — pyocd/libusb can open it. (A stale/broken WinUSB bind
@@ -2375,13 +2453,33 @@ fn decode_stlink_regs(regs: &HashMap<u32, Vec<u32>>, dev_id: Option<u16>) -> Has
 
     // ── Device ID + revision ──
     if let Some(idcode) = first(0xE0042000) {
-        let did = idcode & 0xFFF;
-        let rev_id = (idcode >> 16) & 0xFFFF;
-        let name = fam.map(|f| f.name).unwrap_or("unknown (unrecognized STM32 DEV_ID)");
-        info.insert("Device ID".to_string(), format!("0x{did:03X} — {name}"));
-        // REV_ID → silicon-revision letter is only well-defined per device;
-        // this map covers the 0x410 medium-density part (F103C8 / "Blue Pill").
-        let rev = if did == 0x410 {
+        let did = (idcode & 0xFFF) as u16;
+        let rev_id = ((idcode >> 16) & 0xFFFF) as u16;
+        // Flash size (KB) is decoded again below for the Flash rows, but GD32
+        // model resolution needs it now to pick the density letter.
+        let flash_kb = fam
+            .and_then(|f| regs.get(&f.flash_size_addr))
+            .and_then(|w| w.first().copied())
+            .map(|v| v & 0xFFFF)
+            .filter(|&kb| kb != 0 && kb != 0xFFFF);
+
+        // GigaDevice GD32 mirrors ST's DEV_ID; when the REV_ID proves it's a
+        // clone we lead with the GD32 model, not the ST family name.
+        let gd32 = gd32_identify(did, rev_id, flash_kb);
+        if let Some((name, _core, max_mhz)) = &gd32 {
+            info.insert("Device ID".to_string(), format!("0x{did:03X} — {name}"));
+            info.insert(
+                "Max clock".to_string(),
+                format!("{max_mhz} MHz (GigaDevice GD32; ST's F103 tops out at 72 MHz)"),
+            );
+        } else {
+            let name = fam.map(|f| f.name).unwrap_or("unknown (unrecognized STM32 DEV_ID)");
+            info.insert("Device ID".to_string(), format!("0x{did:03X} — {name}"));
+        }
+
+        // REV_ID → silicon-revision letter is only well-defined for genuine ST
+        // parts (GD32 REV_IDs don't follow ST's scheme); cover ST's 0x410 here.
+        let rev = if gd32.is_none() && did == 0x410 {
             match rev_id {
                 0x0000 => " (rev A)",
                 0x2000 => " (rev B)",
@@ -2393,6 +2491,29 @@ fn decode_stlink_regs(regs: &HashMap<u32, Vec<u32>>, dev_id: Option<u16>) -> Has
             ""
         };
         info.insert("Revision".to_string(), format!("0x{rev_id:04X}{rev}"));
+
+        // Provenance note: firm for a recognized GD32, generic for any other
+        // STM32-compatible clone (known DEV_ID, REV_ID outside ST's set).
+        if gd32.is_some() {
+            info.insert(
+                "Vendor".to_string(),
+                format!(
+                    "GigaDevice GD32 — pin-compatible with ST's STM32F103 but NOT genuine ST silicon. \
+                     DEV_ID 0x{did:03X} mirrors ST; REV_ID 0x{rev_id:04X} (outside ST's set) confirms GD32. \
+                     Package/pin (C=48 R=64 V=100 Z=144) + temp grade are not SWD-readable."
+                ),
+            );
+        } else if let Some(revs) = stm32_known_revs(did) {
+            if !revs.contains(&rev_id) {
+                info.insert(
+                    "Vendor".to_string(),
+                    format!(
+                        "likely an STM32-compatible clone (GigaDevice GD32 / CKS / APM32 / MindMotion) — \
+                         REV_ID 0x{rev_id:04X} is not a documented ST revision for DEV_ID 0x{did:03X}"
+                    ),
+                );
+            }
+        }
     }
 
     // ── Flash size / UID / RDP — only readable once we know the family ──
@@ -2457,7 +2578,7 @@ fn print_stlink_target_info(info: &HashMap<String, String>, board: &str) {
     // Two-layer result: a target answered. Print its read-only identity.
     println!("  Layer 2 - downstream SWD target (read-only) via {board}:");
     for key in [
-        "Device ID", "Revision", "Core", "Architecture", "Max clock", "Flash size",
+        "Device ID", "Revision", "Vendor", "Core", "Architecture", "Max clock", "Flash size",
         "Flash map", "SRAM", "Unique ID", "Read protection", "Identification",
         "Transport", "Access", "Source",
     ] {
@@ -3609,7 +3730,13 @@ fn format_target_rows(
     let mut map = decode_stlink_regs(regs, dev_id);
     if let Some(r) = resolved {
         if let Some(did) = dev_id {
-            map.insert("Device ID".into(), format!("0x{:03X} — {}", did, r.name));
+            // `decode_stlink_regs` already named GD32 clones (which mirror this
+            // DEV_ID) as GigaDevice parts — don't clobber that with the generic
+            // ST family name from the built-in table / .chip override.
+            let decoded_is_gd32 = map.get("Device ID").is_some_and(|d| d.contains("GD32"));
+            if !decoded_is_gd32 {
+                map.insert("Device ID".into(), format!("0x{:03X} — {}", did, r.name));
+            }
         }
         if let Some(kb) = r.sram_kb {
             map.insert("SRAM".into(), format!("{kb} KB"));
@@ -3638,7 +3765,7 @@ fn format_target_rows(
         map.insert("Transport".into(), "SWD (native nusb, read-only)".into());
     }
     [
-        "Device ID", "Revision", "Core", "Architecture", "Max clock", "Flash size",
+        "Device ID", "Revision", "Vendor", "Core", "Architecture", "Max clock", "Flash size",
         "Flash map", "SRAM", "Unique ID", "Read protection", "Transport", "Access", "Source",
     ]
     .iter()
@@ -3685,6 +3812,10 @@ const RP2040_TARGETSEL_CORE0: u32 = 0x01002927;
 const RP2040_TARGETSEL_CORE1: u32 = 0x11002927;
 const RP2040_SYSINFO_CHIP_ID: u32 = 0x40000000;
 const RP2040_SYSINFO_GITREF: u32 = 0x40000014;
+// The RP2040's fixed DPIDR (DPv2, designer 0x927, partno 0xC1). Used to accept a
+// multidrop bring-up by exact match — see `bringup()` for why a version-only test
+// is unsafe when a single-drop STM32 (F103 etc.) hangs off the same probe.
+const RP2040_DPIDR: u32 = 0x0BC12477;
 
 struct CmsisDapLink {
     _device: nusb::Device,
@@ -3869,10 +4000,14 @@ impl CmsisDapLink {
     }
 
     /// Bring up SWD and return `(DPIDR, multidrop)`. A DPv1 part that answers a
-    /// plain DPIDR read is single-drop (STM32). A DPv2 part (RP2040, DPIDR
-    /// version field >= 2) shares the bus with other DPs and needs a TARGETSEL
-    /// to route AP accesses, even if it happened to answer DPIDR — so always go
-    /// multidrop for DPv2. Tries line-reset+TARGETSEL first, then dormant->SWD.
+    /// plain DPIDR read is single-drop (STM32). The RP2040 is a DPv2 multidrop
+    /// part that shares the bus with its sibling core and needs a TARGETSEL to
+    /// route AP accesses. Tries line-reset+TARGETSEL (then dormant->SWD) first,
+    /// accepting multidrop only on an EXACT RP2040 DPIDR match, then falls back
+    /// to the single-drop STM32 path. A version-only (>= 2) test is unsafe here:
+    /// a contended/floating bus — or an STM32 that ignores the TARGETSEL write —
+    /// can return a value with the version field set, which would wrongly send a
+    /// single-drop STM32 (F103 etc.) down the RP2040 SYSINFO path.
     fn bringup(&mut self) -> Result<(u32, bool)> {
         self.connect_swd()?;
         self.swj_clock(100_000)?;
@@ -3880,16 +4015,16 @@ impl CmsisDapLink {
         // idle 0, wait_retry 128 (LE), match_retry 0 — let the probe retry WAITs.
         self.command(&[DAP_TRANSFER_CONFIGURE, 0x00, 0x80, 0x00, 0x00, 0x00])?;
 
-        // Try SWD multidrop first (RP2040 etc.). A valid DPv2 IDCODE has the
-        // version field >= 2; never accept the bus-contention garbage that a
-        // non-selected read returns. Each attempt does its own clean reset.
+        // Try SWD multidrop first (RP2040). Accept only the exact RP2040 DPIDR —
+        // never the bus-contention garbage a non-selected read returns, nor a
+        // single-drop STM32 that ignored the TARGETSEL. Each attempt resets first.
         let mut errs = Vec::new();
         for &dormant in &[true, false] {
             for &targetsel in &[RP2040_TARGETSEL_CORE0, RP2040_TARGETSEL_CORE1] {
                 match self.try_multidrop(dormant, targetsel) {
-                    Ok(dpidr) if (dpidr >> 12) & 0xF >= 2 => return Ok((dpidr, true)),
+                    Ok(dpidr) if dpidr == RP2040_DPIDR => return Ok((dpidr, true)),
                     Ok(dpidr) => errs.push(format!(
-                        "{}/{targetsel:07x}: DPIDR 0x{dpidr:08X} not DPv2",
+                        "{}/{targetsel:07x}: DPIDR 0x{dpidr:08X} != RP2040",
                         if dormant { "dormant" } else { "reset" }
                     )),
                     Err(e) => errs.push(format!(
@@ -3911,6 +4046,14 @@ impl CmsisDapLink {
         anyhow::bail!("no SWD target answered; multidrop: {}", errs.join("; "))
     }
 
+    /// Clear all sticky error flags via the DP ABORT register (STKCMP/STKERR/
+    /// WDERR/ORUNERR, no DAPABORT). A single faulted AP access latches STKERR and
+    /// then every later AP transfer FAULTs until this clears it.
+    fn clear_sticky(&mut self) -> Result<()> {
+        self.dp_write(0x0, 0x1E)?;
+        Ok(())
+    }
+
     /// Power up the debug/system domains and select AP0 for 32-bit MEM-AP reads.
     fn open_mem_ap(&mut self) -> Result<()> {
         self.dp_write(0x4, 0x5000_0000)?; // CTRL/STAT: CSYSPWRUPREQ | CDBGPWRUPREQ
@@ -3924,6 +4067,7 @@ impl CmsisDapLink {
         if !ok {
             anyhow::bail!("DP power-up not acknowledged");
         }
+        self.clear_sticky()?; // a prior multidrop/dormant probe can leave STKERR set
         self.dp_write(0x8, 0x0000_0000)?; // SELECT: AP 0, bank 0
         self.ap_write(0x0, 0x2300_0052)?; // CSW: 32-bit, debug enable
         Ok(())
@@ -3931,8 +4075,19 @@ impl CmsisDapLink {
 
     /// Read one 32-bit word from the target's memory map (read-only). For a
     /// single CMSIS-DAP transfer the firmware completes the posted AP read and
-    /// returns the data directly, so use the DRW read result.
+    /// returns the data directly, so use the DRW read result. On a FAULT (sticky
+    /// STKERR latched by an earlier access), clear it and retry once.
     fn read_mem32(&mut self, addr: u32) -> Result<u32> {
+        match self.read_mem32_once(addr) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let _ = self.clear_sticky();
+                self.read_mem32_once(addr).map_err(|_| e)
+            }
+        }
+    }
+
+    fn read_mem32_once(&mut self, addr: u32) -> Result<u32> {
         self.ap_write(0x4, addr)?; // TAR
         self.ap_read(0xC) // DRW — data returned by the probe
     }
@@ -4044,6 +4199,30 @@ fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<String, Strin
 
     let db = load_chip_db();
     let (regs, dev_id, resolved) = collect_target_regs(|addr| link.read_mem32(addr), &db);
+    if dev_id.is_none() {
+        // The DP answered (we printed a DP IDCODE) but no identity register could
+        // be read — the AHB-AP faulted every access. Report this distinctly
+        // instead of falling through to the generic "no target detected": a debug
+        // port DID respond, the memory bus just didn't. Capture the live fault.
+        let why = link
+            .read_mem32(0xE000ED00)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "AP read returned no usable value".into());
+        info.insert(
+            "Layer 2".into(),
+            format!("target present but unreadable — Arm SW-DP answered, memory/AP access faulted ({why})"),
+        );
+        info.insert(
+            "Hint".into(),
+            "An Arm debug port responded but its memory bus did not (SWD ACK=FAULT). Likely causes: NRST held low \
+             (target stuck in reset); target not fully powered (wire VTREF/3V3 + GND); on a Nucleo driven by an \
+             EXTERNAL probe, remove the two CN2 (ST-LINK) jumpers so the on-board ST-LINK stops contending, then power \
+             the board (USB/E5V); SWDIO/SWCLK swapped; or the chip has debug permanently disabled (STM32 RDP level 2)."
+                .into(),
+        );
+        return Ok(info);
+    }
     for (k, v) in format_target_rows(&regs, dev_id, resolved.as_ref()) {
         info.insert(k.to_string(), v);
     }
@@ -5026,5 +5205,86 @@ option_base 0x40023c14
         let info = decode_stlink_regs(&regs, Some(0x421));
         assert!(info["Device ID"].contains("STM32F446"));
         assert!(info["Core"].contains("Cortex-M4"));
+    }
+
+    #[test]
+    fn native_stm32f103_target_decodes_as_layer2() {
+        // A "Blue Pill" STM32F103C8 hanging off the probe (ST-Link or the RP2040
+        // CMSIS-DAP single-drop path): DEV_ID 0x410, Cortex-M3, 64 KB flash.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x412FC231]); // CPUID: Cortex-M3
+        regs.insert(0xE0042000, vec![0x20036410]); // DBGMCU: DEV_ID 0x410, REV_ID 0x2003
+        regs.insert(0x1FFFF7E0, vec![64]); // F1 flash-size register: 64 KB
+        let info = decode_stlink_regs(&regs, Some(0x410));
+        assert!(info["Device ID"].contains("STM32F1 medium-density"));
+        assert!(info["Core"].contains("Cortex-M3"));
+        assert_eq!(info["Flash size"], "64 KB");
+        assert!(info["Revision"].contains("rev 1/2/3/X/Y"));
+        assert!(!info.contains_key("Vendor")); // genuine ST REV_ID → no clone flag
+    }
+
+    #[test]
+    fn gd32f103ret6_identified_as_gigadevice_not_stm32() {
+        // GD32F103RET6 mirrors ST's high-density DEV_ID 0x414 but reports a
+        // REV_ID (0x1309) outside ST's {0x1000,0x1001,0x1003} set; with 512 KB
+        // flash it resolves to the GD32F103xE density, named as GigaDevice.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x412FC231]); // Cortex-M3 r2p1
+        regs.insert(0xE0042000, vec![0x13090414]); // DBGMCU: DEV_ID 0x414, REV_ID 0x1309
+        regs.insert(0x1FFFF7E0, vec![512]); // F1 high-density flash-size word: 512 KB
+        let info = decode_stlink_regs(&regs, Some(0x414));
+        // Leads with the GD32 model, NOT the ST family name.
+        assert!(info["Device ID"].contains("GD32F103xE"));
+        assert!(info["Device ID"].contains("GD32F103RET6"));
+        assert!(!info["Device ID"].contains("STM32"));
+        assert!(info["Max clock"].contains("108 MHz"));
+        let vendor = info.get("Vendor").expect("GD32 provenance noted");
+        assert!(vendor.contains("GigaDevice") && vendor.contains("0x1309"));
+
+        // A genuine high-density REV_ID must stay STM32 with no GD32 claim.
+        regs.insert(0xE0042000, vec![0x10000414]);
+        let genuine = decode_stlink_regs(&regs, Some(0x414));
+        assert!(genuine["Device ID"].contains("STM32F1 high-density"));
+        assert!(!genuine.contains_key("Vendor"));
+    }
+
+    #[test]
+    fn gd32_density_maps_flash_to_letter() {
+        assert_eq!(gd32_density(Some(512)), "xE");
+        assert_eq!(gd32_density(Some(256)), "xC");
+        assert_eq!(gd32_density(Some(64)), "x8");
+        assert_eq!(gd32_density(None), "");
+        // Non-clone REV_ID → no GD32 identity even on a GD32 DEV_ID.
+        assert!(gd32_identify(0x414, 0x1000, Some(512)).is_none());
+        // Clone REV_ID on an untracked DEV_ID → no model (generic clone flag only).
+        assert!(gd32_identify(0x412, 0x9999, Some(64)).is_none());
+    }
+
+    #[test]
+    fn format_target_rows_keeps_gd32_name_over_builtin_stm32() {
+        // The full layer-2 path (ST-Link / CMSIS-DAP): decode names the GD32, and
+        // the resolved built-in STM32 high-density entry must NOT clobber it.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x412FC231]);
+        regs.insert(0xE0042000, vec![0x13090414]); // DEV_ID 0x414, clone REV_ID 0x1309
+        regs.insert(0x1FFFF7E0, vec![512]); // 512 KB → xE
+        let resolved = resolve_chip(0x414, &[]).expect("0x414 resolves to built-in STM32");
+        let rows = format_target_rows(&regs, Some(0x414), Some(&resolved));
+        let dev = &rows.iter().find(|(k, _)| *k == "Device ID").unwrap().1;
+        assert!(dev.contains("GD32F103xE") && dev.contains("GD32F103RET6"));
+        assert!(!dev.contains("STM32"));
+        assert!(rows.iter().any(|(k, v)| *k == "Vendor" && v.contains("GigaDevice")));
+    }
+
+    #[test]
+    fn cmsisdap_rejects_non_rp2040_multidrop_dpidr() {
+        // A bus-contention / STM32-ignored-TARGETSEL read can have version >= 2
+        // set; only the exact RP2040 DPIDR must be treated as multidrop so an
+        // STM32F103 reaches the single-drop decode path instead of RP2040 SYSINFO.
+        assert_eq!(RP2040_DPIDR, 0x0BC12477);
+        assert!((RP2040_DPIDR >> 12) & 0xF >= 2); // it IS DPv2…
+        let bogus = 0x1BA02477u32; // …but a different DPIDR (also version 2) is not RP2040
+        assert!((bogus >> 12) & 0xF >= 2);
+        assert_ne!(bogus, RP2040_DPIDR);
     }
 }
