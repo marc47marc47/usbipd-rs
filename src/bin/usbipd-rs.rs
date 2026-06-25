@@ -4000,13 +4000,15 @@ impl CmsisDapLink {
     }
 
     /// Bring up SWD and return `(DPIDR, multidrop)`. A DPv1 part that answers a
-    /// plain DPIDR read is single-drop (STM32). The RP2040 is a DPv2 multidrop
+    /// plain DPIDR read is single-drop (STM32/GD32). The RP2040 is a DPv2 multidrop
     /// part that shares the bus with its sibling core and needs a TARGETSEL to
-    /// route AP accesses. Tries line-reset+TARGETSEL (then dormant->SWD) first,
-    /// accepting multidrop only on an EXACT RP2040 DPIDR match, then falls back
-    /// to the single-drop STM32 path. A version-only (>= 2) test is unsafe here:
-    /// a contended/floating bus — or an STM32 that ignores the TARGETSEL write —
-    /// can return a value with the version field set, which would wrongly send a
+    /// route AP accesses. Tries the single-drop path FIRST (with a few retries, so a
+    /// flaky dupont link gets more than one shot) — it sends no TARGETSEL and so
+    /// can't disturb a DPv2 target — and accepts only a DPv1 (version < 2) DPIDR.
+    /// Only if that fails does it try line-reset+TARGETSEL (then dormant->SWD),
+    /// accepting multidrop only on an EXACT RP2040 DPIDR match. A version-only
+    /// (>= 2) test is unsafe: a contended/floating bus — or an STM32 that ignores
+    /// the TARGETSEL write — can set the version field, which would wrongly send a
     /// single-drop STM32 (F103 etc.) down the RP2040 SYSINFO path.
     fn bringup(&mut self) -> Result<(u32, bool)> {
         self.connect_swd()?;
@@ -4015,9 +4017,29 @@ impl CmsisDapLink {
         // idle 0, wait_retry 128 (LE), match_retry 0 — let the probe retry WAITs.
         self.command(&[DAP_TRANSFER_CONFIGURE, 0x00, 0x80, 0x00, 0x00, 0x00])?;
 
-        // Try SWD multidrop first (RP2040). Accept only the exact RP2040 DPIDR —
-        // never the bus-contention garbage a non-selected read returns, nor a
-        // single-drop STM32 that ignored the TARGETSEL. Each attempt resets first.
+        // Single-drop first (STM32 / GD32 / most DPv1 targets — the common case).
+        // It sends NO TARGETSEL, so it can never disturb a DPv2 target, and it's
+        // the cheapest path. Retry the line-reset + DPIDR read several times: on
+        // dupont wiring the first read after a re-plug often returns ack 0x07
+        // (floating bus) before a clean DPIDR settles — one-shot here is exactly
+        // what made detection "sometimes works, sometimes not". Mirrors the probe
+        // firmware's 12x swd_read_dpidr. Accept only a DPv1 (version < 2) DPIDR.
+        const SINGLE_TRIES: usize = 10;
+        let mut last = 0u32;
+        for _ in 0..SINGLE_TRIES {
+            self.line_reset_and_switch()?;
+            if let Ok(dpidr) = self.dp_read(0x0) {
+                if (dpidr >> 12) & 0xF < 2 {
+                    let _ = self.dp_write(0x0, 0x1E); // clear sticky
+                    return Ok((dpidr, false));
+                }
+                last = dpidr; // version >= 2: not single-drop — try multidrop below
+            }
+        }
+
+        // Not a DPv1 single-drop target → try SWD multidrop (RP2040). Accept only
+        // the EXACT RP2040 DPIDR — never bus-contention garbage a non-selected read
+        // returns, nor a single-drop STM32 that ignored the TARGETSEL. Resets first.
         let mut errs = Vec::new();
         for &dormant in &[true, false] {
             for &targetsel in &[RP2040_TARGETSEL_CORE0, RP2040_TARGETSEL_CORE1] {
@@ -4034,16 +4056,10 @@ impl CmsisDapLink {
                 }
             }
         }
-
-        // Single-drop (STM32 / DPv1).
-        self.line_reset_and_switch()?;
-        if let Ok(dpidr) = self.dp_read(0x0) {
-            if (dpidr >> 12) & 0xF < 2 {
-                let _ = self.dp_write(0x0, 0x1E);
-                return Ok((dpidr, false));
-            }
-        }
-        anyhow::bail!("no SWD target answered; multidrop: {}", errs.join("; "))
+        anyhow::bail!(
+            "no SWD target answered after {SINGLE_TRIES} single-drop tries (last DPIDR 0x{last:08X}); multidrop: {}",
+            errs.join("; ")
+        )
     }
 
     /// Clear all sticky error flags via the DP ABORT register (STKCMP/STKERR/
