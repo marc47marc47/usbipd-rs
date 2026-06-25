@@ -1,5 +1,81 @@
 use crate::*;
 
+/// What a single probe invocation needs: the device's VID:PID and, for serial
+/// probes, the COM port it was found on.
+pub(crate) struct ProbeCtx<'a> {
+    pub(crate) vid: u16,
+    pub(crate) pid: u16,
+    pub(crate) port: Option<&'a str>,
+}
+
+/// A probe's parsed result, tagged by which formatter renders it. Adding a new
+/// probe means adding a variant here plus an arm in `ProbeKind::run` and
+/// `ProbeReport::print` — no scattered match sites elsewhere.
+pub(crate) enum ProbeReport {
+    Esp(HashMap<String, String>),
+    Avr(HashMap<String, String>),
+    Stm32Flash(HashMap<String, String>),
+    Dfu(HashMap<String, String>),
+    Ftdi(HashMap<String, String>),
+    Pico(HashMap<String, String>),
+    Daplink(HashMap<String, String>),
+    Pyocd(HashMap<String, String>),
+    StlinkController(StlinkControllerInfo),
+    Target(HashMap<String, String>),
+}
+
+impl ProbeReport {
+    pub(crate) fn is_empty(&self) -> bool {
+        use ProbeReport::*;
+        match self {
+            Esp(m) | Avr(m) | Stm32Flash(m) | Dfu(m) | Ftdi(m) | Pico(m) | Daplink(m) | Pyocd(m)
+            | Target(m) => m.is_empty(),
+            StlinkController(i) => i.is_empty(),
+        }
+    }
+
+    pub(crate) fn print(&self, board: &str) {
+        match self {
+            ProbeReport::Esp(m) => print_esp_info(m),
+            ProbeReport::Avr(m) => print_avr_info(m, board),
+            ProbeReport::Stm32Flash(m) => print_stm32_info(m, board),
+            ProbeReport::Dfu(m) => print_dfu_info(m, board),
+            ProbeReport::Ftdi(m) => print_ftdi_info(m, board),
+            ProbeReport::Pico(m) => print_pico_info(m, board),
+            ProbeReport::Daplink(m) => print_daplink_info(m, board),
+            ProbeReport::Pyocd(m) => print_pyocd_info(m),
+            ProbeReport::StlinkController(i) => i.print(),
+            ProbeReport::Target(m) => print_stlink_target_info(m, board),
+        }
+    }
+}
+
+impl ProbeKind {
+    /// Run this probe against a device and return its parsed report. Serial
+    /// probes (`Espflash`/`Avrdude`/`Stm32Flash`) require `ctx.port`.
+    pub(crate) fn run(&self, ctx: &ProbeCtx) -> Result<ProbeReport> {
+        let (vid, pid) = (ctx.vid, ctx.pid);
+        Ok(match self {
+            ProbeKind::Espflash => ProbeReport::Esp(run_espflash_board_info(ctx.port.unwrap())?),
+            ProbeKind::Avrdude { targets } => {
+                ProbeReport::Avr(run_avrdude_query(ctx.port.unwrap(), targets)?)
+            }
+            ProbeKind::Stm32Flash => ProbeReport::Stm32Flash(run_stm32flash_query(ctx.port.unwrap())?),
+            ProbeKind::Dfu => ProbeReport::Dfu(run_dfu_info(vid, pid)?),
+            ProbeKind::Ftdi => ProbeReport::Ftdi(run_ftdi_info(vid, pid)?),
+            ProbeKind::Picotool => ProbeReport::Pico(run_picotool_info(vid, pid)?),
+            ProbeKind::Daplink => ProbeReport::Daplink(run_daplink_query()?),
+            ProbeKind::Pyocd => ProbeReport::Pyocd(run_pyocd_query(vid, pid)?),
+            ProbeKind::Stlink => ProbeReport::StlinkController(run_stlink_controller_query(vid, pid)?),
+            ProbeKind::StlinkTarget => ProbeReport::Target(run_stlink_target_query(vid, pid)?),
+            ProbeKind::CmsisDap => {
+                ProbeReport::StlinkController(run_cmsisdap_controller_query(vid, pid)?)
+            }
+            ProbeKind::CmsisDapTarget => ProbeReport::Target(run_cmsisdap_target_query(vid, pid)?),
+        })
+    }
+}
+
 pub(crate) fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
     println!("=== Board Probe ===");
     let serial_ports = serialport::available_ports().unwrap_or_default();
@@ -54,42 +130,13 @@ pub(crate) fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 entry.busid, board.name, header_port, probe.tool_name()
             );
 
-            let result = match probe {
-                ProbeKind::Espflash => run_espflash_board_info(port_name.as_deref().unwrap()),
-                ProbeKind::Avrdude { targets } => {
-                    run_avrdude_query(port_name.as_deref().unwrap(), targets)
-                }
-                ProbeKind::Stm32Flash => run_stm32flash_query(port_name.as_deref().unwrap()),
-                ProbeKind::Dfu => run_dfu_info(vid, pid),
-                ProbeKind::Ftdi => run_ftdi_info(vid, pid),
-                ProbeKind::Picotool => run_picotool_info(vid, pid),
-                ProbeKind::Daplink => run_daplink_query(),
-                ProbeKind::Pyocd => run_pyocd_query(vid, pid),
-                ProbeKind::Stlink => run_stlink_controller_query(vid, pid),
-                ProbeKind::StlinkTarget => run_stlink_target_query(vid, pid),
-                ProbeKind::CmsisDap => run_cmsisdap_controller_query(vid, pid),
-                ProbeKind::CmsisDapTarget => run_cmsisdap_target_query(vid, pid),
-            };
-
-            match result {
-                Ok(info) if !info.is_empty() => {
+            let ctx = ProbeCtx { vid, pid, port: port_name.as_deref() };
+            match probe.run(&ctx) {
+                Ok(report) if !report.is_empty() => {
                     if needs_port {
                         serial_chip_found = true;
                     }
-                    match probe {
-                        ProbeKind::Espflash => print_esp_info(&info),
-                        ProbeKind::Avrdude { .. } => print_avr_info(&info, board.name),
-                        ProbeKind::Stm32Flash => print_stm32_info(&info, board.name),
-                        ProbeKind::Dfu => print_dfu_info(&info, board.name),
-                        ProbeKind::Ftdi => print_ftdi_info(&info, board.name),
-                        ProbeKind::Picotool => print_pico_info(&info, board.name),
-                        ProbeKind::Daplink => print_daplink_info(&info, board.name),
-                        ProbeKind::Pyocd => print_pyocd_info(&info),
-                        ProbeKind::Stlink => print_stlink_controller_info(&info),
-                        ProbeKind::StlinkTarget => print_stlink_target_info(&info, board.name),
-                        ProbeKind::CmsisDap => print_stlink_controller_info(&info),
-                        ProbeKind::CmsisDapTarget => print_stlink_target_info(&info, board.name),
-                    }
+                    report.print(board.name);
                 }
                 Ok(_) => println!("  (no info parsed from output)"),
                 Err(e) => {

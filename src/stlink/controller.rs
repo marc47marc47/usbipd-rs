@@ -87,10 +87,88 @@ pub(crate) fn stlink_controller_profile(pid: u16) -> Option<StlinkControllerProf
     })
 }
 
+/// A layer-1 debug-controller report (ST-Link or CMSIS-DAP probe). Every row is
+/// optional because the two producers fill different subsets; `print` emits the
+/// present rows in a fixed order.
+#[derive(Default)]
+pub(crate) struct StlinkControllerInfo {
+    pub(crate) layer: Option<String>,
+    pub(crate) generation: Option<String>,
+    pub(crate) controller_mcu: Option<String>,
+    pub(crate) core: Option<String>,
+    pub(crate) architecture: Option<String>,
+    pub(crate) max_clock: Option<String>,
+    pub(crate) flash: Option<String>,
+    pub(crate) sram: Option<String>,
+    pub(crate) package: Option<String>,
+    pub(crate) supply: Option<String>,
+    pub(crate) flash_map: Option<String>,
+    pub(crate) sram_map: Option<String>,
+    pub(crate) system_memory: Option<String>,
+    pub(crate) option_bytes: Option<String>,
+    pub(crate) unique_id: Option<String>,
+    pub(crate) controller_debug: Option<String>,
+    pub(crate) upstream: Option<String>,
+    pub(crate) downstream: Option<String>,
+    pub(crate) usb_identity: Option<String>,
+    pub(crate) descriptor_access: Option<String>,
+    pub(crate) usb_product: Option<String>,
+    pub(crate) usb_serial: Option<String>,
+    pub(crate) usb_device_version: Option<String>,
+    pub(crate) debug_interface_driver: Option<String>,
+    pub(crate) identification: Option<String>,
+    pub(crate) firmware_access: Option<String>,
+    pub(crate) layer2: Option<String>,
+}
+
+impl StlinkControllerInfo {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.layer.is_none() && self.generation.is_none() && self.usb_identity.is_none()
+    }
+
+    pub(crate) fn print(&self) {
+        println!("  Architecture:");
+        let rows: [(&str, &Option<String>); 27] = [
+            ("Layer", &self.layer),
+            ("Generation", &self.generation),
+            ("Controller MCU", &self.controller_mcu),
+            ("Core", &self.core),
+            ("Architecture", &self.architecture),
+            ("Max clock", &self.max_clock),
+            ("Flash", &self.flash),
+            ("SRAM", &self.sram),
+            ("Package", &self.package),
+            ("Supply", &self.supply),
+            ("Flash map", &self.flash_map),
+            ("SRAM map", &self.sram_map),
+            ("System memory", &self.system_memory),
+            ("Option bytes", &self.option_bytes),
+            ("Unique ID", &self.unique_id),
+            ("Controller debug", &self.controller_debug),
+            ("Upstream", &self.upstream),
+            ("Downstream", &self.downstream),
+            ("USB identity", &self.usb_identity),
+            ("Descriptor access", &self.descriptor_access),
+            ("USB product", &self.usb_product),
+            ("USB serial", &self.usb_serial),
+            ("USB device version", &self.usb_device_version),
+            ("Debug interface driver", &self.debug_interface_driver),
+            ("Identification", &self.identification),
+            ("Firmware access", &self.firmware_access),
+            ("Layer 2", &self.layer2),
+        ];
+        for (key, val) in rows {
+            if let Some(value) = val {
+                println!("  {:<24} {}", format!("{key}:"), value);
+            }
+        }
+    }
+}
+
 /// Return only the USB-visible debug-controller architecture (layer 1).
 /// This function enumerates cached descriptors and never opens the debug
 /// interface, so it cannot issue an SWD/JTAG command or touch layer 2.
-pub(crate) fn run_stlink_controller_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+pub(crate) fn run_stlink_controller_query(vid: u16, pid: u16) -> Result<StlinkControllerInfo> {
     let profile = stlink_controller_profile(pid)
         .ok_or_else(|| anyhow::anyhow!("no layer-1 ST-Link profile for {vid:04x}:{pid:04x}"))?;
     // Descriptor details are optional; the architecture profile remains valid
@@ -100,98 +178,50 @@ pub(crate) fn run_stlink_controller_query(vid: u16, pid: u16) -> Result<HashMap<
         .ok()
         .and_then(|mut devices| devices.find(|d| d.vendor_id() == vid && d.product_id() == pid));
 
-    let mut info = HashMap::new();
-    info.insert("Layer".into(), "1 - USB debug controller".into());
-    info.insert("Generation".into(), profile.generation.into());
-    info.insert("Controller MCU".into(), profile.controller_mcu.into());
-    info.insert("Core".into(), profile.core.into());
-    info.insert("Architecture".into(), profile.architecture.into());
-    info.insert("Max clock".into(), profile.max_clock.into());
-    info.insert("Flash".into(), profile.flash.into());
-    info.insert("SRAM".into(), profile.sram.into());
-    info.insert("Package".into(), profile.package.into());
-    info.insert("Supply".into(), profile.supply.into());
-    info.insert("Flash map".into(), profile.flash_map.into());
-    info.insert("SRAM map".into(), profile.sram_map.into());
-    info.insert("System memory".into(), profile.system_memory.into());
-    info.insert("Option bytes".into(), profile.option_bytes.into());
-    info.insert("Unique ID".into(), profile.unique_id.into());
-    info.insert("Controller debug".into(), profile.self_debug.into());
-    info.insert("Upstream".into(), profile.upstream.into());
-    info.insert("Downstream".into(), profile.downstream.into());
-    info.insert("USB identity".into(), format!("{vid:04x}:{pid:04x}"));
-    info.insert("Identification".into(), profile.confidence.into());
-    info.insert(
-        "Firmware access".into(),
-        "Not attempted; read-protection status unknown".into(),
-    );
-    info.insert(
-        "Layer 2".into(),
-        "Auto-probed read-only below (native SWD)".into(),
-    );
+    let mut info = StlinkControllerInfo {
+        layer: Some("1 - USB debug controller".into()),
+        generation: Some(profile.generation.into()),
+        controller_mcu: Some(profile.controller_mcu.into()),
+        core: Some(profile.core.into()),
+        architecture: Some(profile.architecture.into()),
+        max_clock: Some(profile.max_clock.into()),
+        flash: Some(profile.flash.into()),
+        sram: Some(profile.sram.into()),
+        package: Some(profile.package.into()),
+        supply: Some(profile.supply.into()),
+        flash_map: Some(profile.flash_map.into()),
+        sram_map: Some(profile.sram_map.into()),
+        system_memory: Some(profile.system_memory.into()),
+        option_bytes: Some(profile.option_bytes.into()),
+        unique_id: Some(profile.unique_id.into()),
+        controller_debug: Some(profile.self_debug.into()),
+        upstream: Some(profile.upstream.into()),
+        downstream: Some(profile.downstream.into()),
+        usb_identity: Some(format!("{vid:04x}:{pid:04x}")),
+        identification: Some(profile.confidence.into()),
+        firmware_access: Some("Not attempted; read-protection status unknown".into()),
+        layer2: Some("Auto-probed read-only below (native SWD)".into()),
+        ..Default::default()
+    };
     if let Some(dev) = dev {
-        info.insert("Descriptor access".into(), "Available through nusb".into());
+        info.descriptor_access = Some("Available through nusb".into());
         if let Some(product) = dev.product_string() {
-            info.insert("USB product".into(), product.into());
+            info.usb_product = Some(product.into());
         }
         if let Some(serial) = dev.serial_number() {
-            info.insert("USB serial".into(), serial.into());
+            info.usb_serial = Some(serial.into());
         }
-        info.insert(
-            "USB device version".into(),
-            format!("0x{:04x}", dev.device_version()),
-        );
+        info.usb_device_version = Some(format!("0x{:04x}", dev.device_version()));
     } else {
-        info.insert(
-            "Descriptor access".into(),
-            "Unavailable through nusb; VID:PID profile still shown".into(),
-        );
+        info.descriptor_access =
+            Some("Unavailable through nusb; VID:PID profile still shown".into());
     }
     if let Some(driver) = stlink_driver_check(pid) {
-        let driver = match driver {
+        info.debug_interface_driver = Some(match driver {
             StlinkDriver::WinUsb => "WinUSB".to_string(),
             StlinkDriver::Other(service) => service,
-        };
-        info.insert("Debug interface driver".into(), driver);
+        });
     }
     Ok(info)
-}
-
-pub(crate) fn print_stlink_controller_info(info: &HashMap<String, String>) {
-    println!("  Architecture:");
-    let order = [
-        "Layer",
-        "Generation",
-        "Controller MCU",
-        "Core",
-        "Architecture",
-        "Max clock",
-        "Flash",
-        "SRAM",
-        "Package",
-        "Supply",
-        "Flash map",
-        "SRAM map",
-        "System memory",
-        "Option bytes",
-        "Unique ID",
-        "Controller debug",
-        "Upstream",
-        "Downstream",
-        "USB identity",
-        "Descriptor access",
-        "USB product",
-        "USB serial",
-        "USB device version",
-        "Debug interface driver",
-        "Identification",
-        "Firmware access",
-        "Layer 2",
-    ];
-    for key in order {
-        if let Some(value) = info.get(key) {
-            println!("  {:<24} {}", format!("{key}:"), value);
-        }
-    }
 }
 

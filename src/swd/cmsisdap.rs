@@ -324,43 +324,41 @@ impl CmsisDapLink {
 
 /// Layer 1: identify an RP2040-based CMSIS-DAP debug probe from VID:PID + USB
 /// descriptors (no SWD command issued). Keys match `print_stlink_controller_info`.
-pub(crate) fn run_cmsisdap_controller_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
-    let mut info = HashMap::new();
+pub(crate) fn run_cmsisdap_controller_query(vid: u16, pid: u16) -> Result<StlinkControllerInfo> {
     let generation = match pid {
         0x000c => "Raspberry Pi Debug Probe (debugprobe firmware)",
         0x0004 => "picoprobe (Pico-as-probe firmware)",
         _ => "RP2040 CMSIS-DAP probe",
     };
-    for (k, v) in [
-        ("Layer", "1 - USB debug probe (CMSIS-DAP)"),
-        ("Generation", generation),
-        ("Controller MCU", "RP2040 (dual Arm Cortex-M0+)"),
-        ("Core", "2x Arm Cortex-M0+"),
-        ("Architecture", "Armv6-M, Thumb/Thumb-2 subset"),
-        ("Max clock", "133 MHz"),
-        ("Flash", "External QSPI (e.g. 2 MB on a Pico)"),
-        ("SRAM", "264 KB"),
-        ("Upstream", "USB 2.0 Full Speed (CMSIS-DAP v2 bulk + CDC UART)"),
-        ("Downstream", "SWD (+ UART bridge)"),
-    ] {
-        info.insert(k.to_string(), v.to_string());
-    }
-    info.insert("USB identity".into(), format!("{vid:04x}:{pid:04x}"));
+    let mut info = StlinkControllerInfo {
+        layer: Some("1 - USB debug probe (CMSIS-DAP)".into()),
+        generation: Some(generation.into()),
+        controller_mcu: Some("RP2040 (dual Arm Cortex-M0+)".into()),
+        core: Some("2x Arm Cortex-M0+".into()),
+        architecture: Some("Armv6-M, Thumb/Thumb-2 subset".into()),
+        max_clock: Some("133 MHz".into()),
+        flash: Some("External QSPI (e.g. 2 MB on a Pico)".into()),
+        sram: Some("264 KB".into()),
+        upstream: Some("USB 2.0 Full Speed (CMSIS-DAP v2 bulk + CDC UART)".into()),
+        downstream: Some("SWD (+ UART bridge)".into()),
+        usb_identity: Some(format!("{vid:04x}:{pid:04x}")),
+        identification: Some("VID:PID identifies an RP2040 CMSIS-DAP probe".into()),
+        layer2: Some("Auto-probed read-only below (native CMSIS-DAP)".into()),
+        ..Default::default()
+    };
     if let Some(dev) = nusb::list_devices()
         .wait()
         .ok()
         .and_then(|mut it| it.find(|d| d.vendor_id() == vid && d.product_id() == pid))
     {
-        info.insert("Descriptor access".into(), "Available through nusb".into());
+        info.descriptor_access = Some("Available through nusb".into());
         if let Some(p) = dev.product_string() {
-            info.insert("USB product".into(), p.to_string());
+            info.usb_product = Some(p.to_string());
         }
         if let Some(s) = dev.serial_number() {
-            info.insert("USB serial".into(), s.to_string());
+            info.usb_serial = Some(s.to_string());
         }
     }
-    info.insert("Identification".into(), "VID:PID identifies an RP2040 CMSIS-DAP probe".into());
-    info.insert("Layer 2".into(), "Auto-probed read-only below (native CMSIS-DAP)".into());
     Ok(info)
 }
 

@@ -50,24 +50,7 @@ pub(crate) fn cmd_list_usb() -> Result<()> {
     } else {
         println!("Probable boards detected:");
         for (e, b) in &candidates {
-            let labels: Vec<&str> = b
-                .probes
-                .iter()
-                .map(|p| match p {
-                    ProbeKind::Espflash => "ESP",
-                    ProbeKind::Avrdude { .. } => "AVR",
-                    ProbeKind::Stm32Flash => "STM32",
-                    ProbeKind::Dfu => "DFU",
-                    ProbeKind::Ftdi => "FTDI",
-                    ProbeKind::Picotool => "RP2",
-                    ProbeKind::Daplink => "DAP",
-                    ProbeKind::Pyocd => "SWD",
-                    ProbeKind::Stlink => "STL",
-                    ProbeKind::StlinkTarget => "SWD2",
-                    ProbeKind::CmsisDap => "DAP",
-                    ProbeKind::CmsisDapTarget => "SWD2",
-                })
-                .collect();
+            let labels: Vec<&str> = b.probes.iter().map(|p| p.label()).collect();
             println!(
                 "  - [{}] {} ({}) at BUSID {}",
                 labels.join("+"),

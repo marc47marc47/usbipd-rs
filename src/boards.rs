@@ -77,6 +77,24 @@ impl ProbeKind {
             ProbeKind::CmsisDapTarget => "native CMSIS-DAP SWD (layer 2)",
         }
     }
+
+    /// Short tag shown in the "Probable boards detected" listing.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            ProbeKind::Espflash => "ESP",
+            ProbeKind::Avrdude { .. } => "AVR",
+            ProbeKind::Stm32Flash => "STM32",
+            ProbeKind::Dfu => "DFU",
+            ProbeKind::Ftdi => "FTDI",
+            ProbeKind::Picotool => "RP2",
+            ProbeKind::Daplink => "DAP",
+            ProbeKind::Pyocd => "SWD",
+            ProbeKind::Stlink => "STL",
+            ProbeKind::StlinkTarget => "SWD2",
+            ProbeKind::CmsisDap => "DAP",
+            ProbeKind::CmsisDapTarget => "SWD2",
+        }
+    }
 }
 
 pub(crate) struct KnownBoard {
