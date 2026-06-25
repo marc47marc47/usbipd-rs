@@ -1,6 +1,60 @@
 use crate::*;
 
-pub(crate) fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<HashMap<String, String>> {
+/// Parsed avrdude `-v` output for a synced AVR target. `requested_mcu` records
+/// the `-p` guess (kept for context; not printed); the rest are read back.
+#[derive(Default)]
+pub(crate) struct AvrInfo {
+    pub(crate) requested_mcu: Option<String>,
+    pub(crate) detected_mcu: Option<String>,
+    pub(crate) signature: Option<String>,
+    pub(crate) sig_matches: Option<String>,
+    pub(crate) programmer: Option<String>,
+    pub(crate) bootloader: Option<String>,
+    pub(crate) hw_version: Option<String>,
+    pub(crate) fw_version: Option<String>,
+    pub(crate) modes: Option<String>,
+}
+
+impl AvrInfo {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.requested_mcu.is_none()
+            && self.detected_mcu.is_none()
+            && self.signature.is_none()
+            && self.programmer.is_none()
+            && self.bootloader.is_none()
+    }
+
+    pub(crate) fn print(&self, board_name: &str) {
+        println!("  {:<20} {}", "Board:", board_name);
+        let rows: [(&str, &Option<String>); 8] = [
+            ("Detected MCU", &self.detected_mcu),
+            ("Signature", &self.signature),
+            ("Sig matches", &self.sig_matches),
+            ("Programmer", &self.programmer),
+            ("Bootloader", &self.bootloader),
+            ("HW Version", &self.hw_version),
+            ("FW Version", &self.fw_version),
+            ("Modes", &self.modes),
+        ];
+        for (k, v) in rows {
+            if let Some(v) = v {
+                println!("  {:<20} {}", format!("{k}:"), v);
+            }
+        }
+        if let Some(mcu) = &self.detected_mcu {
+            let summary = avr_chip_summary(mcu.as_str());
+            if !summary.is_empty() {
+                println!("  {:<20} {}", "Summary:", summary);
+            }
+        }
+        println!(
+            "  {:<20} (fuses require an ISP programmer on the ICSP header)",
+            "Fuses:"
+        );
+    }
+}
+
+pub(crate) fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<AvrInfo> {
     // Serial bootloader programmers (arduino/wiring/avr109/stk500v1/stk500v2)
     // can read flash/eeprom/signature but NOT fuses — fuse reads return 0
     // silently. Skip fuse reads here; only an ISP programmer on the ICSP
@@ -67,31 +121,37 @@ pub(crate) fn summarize_avrdude_error(stderr: &str, target: &AvrTarget, baud: u3
     }
 }
 
-pub(crate) fn parse_avrdude_output(_stdout: &str, stderr: &str, requested_mcu: &str) -> HashMap<String, String> {
-    let mut info = HashMap::new();
-    info.insert("Requested MCU".to_string(), requested_mcu.to_string());
-
-    let prefixes: &[(&str, &str)] = &[
-        ("AVR part",          "Detected MCU"),
-        ("Programmer type",   "Programmer"),
-        ("Description",       "Bootloader"),
-        ("HW Version",        "HW Version"),
-        ("FW Version",        "FW Version"),
-        ("Programming modes", "Modes"),
-    ];
+pub(crate) fn parse_avrdude_output(_stdout: &str, stderr: &str, requested_mcu: &str) -> AvrInfo {
+    let mut info = AvrInfo {
+        requested_mcu: Some(requested_mcu.to_string()),
+        ..Default::default()
+    };
 
     for raw in stderr.lines() {
         let line = raw.trim_end();
-
-        for (prefix, label) in prefixes {
-            if let Some(rest) = line.strip_prefix(prefix) {
-                if let Some(idx) = rest.find(':') {
-                    let value = rest[idx + 1..].trim();
-                    if !value.is_empty() {
-                        info.insert((*label).to_string(), value.to_string());
-                    }
-                }
-            }
+        // Extract the value after a "Prefix ... :" label, if non-empty.
+        let field = |prefix: &str| {
+            line.strip_prefix(prefix)
+                .and_then(|rest| rest.find(':').map(|idx| rest[idx + 1..].trim().to_string()))
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = field("AVR part") {
+            info.detected_mcu = Some(v);
+        }
+        if let Some(v) = field("Programmer type") {
+            info.programmer = Some(v);
+        }
+        if let Some(v) = field("Description") {
+            info.bootloader = Some(v);
+        }
+        if let Some(v) = field("HW Version") {
+            info.hw_version = Some(v);
+        }
+        if let Some(v) = field("FW Version") {
+            info.fw_version = Some(v);
+        }
+        if let Some(v) = field("Programming modes") {
+            info.modes = Some(v);
         }
 
         // "Device signature = 1E 95 0F (ATmega328P, ATA6614Q, LGT8F328P)"
@@ -100,40 +160,15 @@ pub(crate) fn parse_avrdude_output(_stdout: &str, stderr: &str, requested_mcu: &
                 Some((s, a)) => (s.trim(), a.trim_end_matches(')').trim()),
                 None => (rest.trim(), ""),
             };
-            info.insert("Signature".to_string(), sig.to_string());
+            info.signature = Some(sig.to_string());
             if !alt.is_empty() {
-                info.insert("Sig matches".to_string(), alt.to_string());
+                info.sig_matches = Some(alt.to_string());
             }
         }
     }
     info
 }
 
-pub(crate) fn print_avr_info(info: &HashMap<String, String>, board_name: &str) {
-    println!("  {:<20} {}", "Board:", board_name);
-    let order = [
-        "Detected MCU",
-        "Signature",
-        "Sig matches",
-        "Programmer",
-        "Bootloader",
-        "HW Version",
-        "FW Version",
-        "Modes",
-    ];
-    for k in order {
-        if let Some(v) = info.get(k) {
-            println!("  {:<20} {}", format!("{k}:"), v);
-        }
-    }
-    if let Some(mcu) = info.get("Detected MCU") {
-        let summary = avr_chip_summary(mcu.as_str());
-        if !summary.is_empty() {
-            println!("  {:<20} {}", "Summary:", summary);
-        }
-    }
-    println!("  {:<20} (fuses require an ISP programmer on the ICSP header)", "Fuses:");
-}
 pub(crate) fn avr_chip_summary(mcu: &str) -> &'static str {
     match mcu.to_ascii_lowercase().as_str() {
         "atmega328p" | "atmega328" => "32 KB flash, 2 KB SRAM, 1 KB EEPROM, 16 MHz",

@@ -44,7 +44,52 @@ pub(crate) fn find_stm32flash() -> PathBuf {
     PathBuf::from("stm32flash")
 }
 
-pub(crate) fn run_stm32flash_query(port: &str) -> Result<HashMap<String, String>> {
+/// Parsed `stm32flash` system-bootloader handshake output.
+#[derive(Default)]
+pub(crate) struct Stm32FlashInfo {
+    pub(crate) version: Option<String>,
+    pub(crate) option_1: Option<String>,
+    pub(crate) option_2: Option<String>,
+    pub(crate) device_id: Option<String>,
+    pub(crate) ram: Option<String>,
+    pub(crate) flash: Option<String>,
+    pub(crate) option_ram: Option<String>,
+    pub(crate) system_ram: Option<String>,
+}
+
+impl Stm32FlashInfo {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.version.is_none()
+            && self.option_1.is_none()
+            && self.option_2.is_none()
+            && self.device_id.is_none()
+            && self.ram.is_none()
+            && self.flash.is_none()
+            && self.option_ram.is_none()
+            && self.system_ram.is_none()
+    }
+
+    pub(crate) fn print(&self, board_name: &str) {
+        println!("  {:<20} {}", "Bridge:", board_name);
+        let rows: [(&str, &Option<String>); 8] = [
+            ("Device ID", &self.device_id),
+            ("Flash", &self.flash),
+            ("RAM", &self.ram),
+            ("System ROM", &self.system_ram),
+            ("Option RAM", &self.option_ram),
+            ("Option byte 1", &self.option_1),
+            ("Option byte 2", &self.option_2),
+            ("Bootloader ver", &self.version),
+        ];
+        for (label, v) in rows {
+            if let Some(v) = v {
+                println!("  {:<20} {}", format!("{label}:"), v);
+            }
+        }
+    }
+}
+
+pub(crate) fn run_stm32flash_query(port: &str) -> Result<Stm32FlashInfo> {
     let stm32flash = find_stm32flash();
     let output = Command::new(&stm32flash)
         .arg(port)
@@ -84,7 +129,7 @@ pub(crate) fn run_stm32flash_query(port: &str) -> Result<HashMap<String, String>
     Ok(parse_stm32flash_output(&stdout))
 }
 
-pub(crate) fn parse_stm32flash_output(s: &str) -> HashMap<String, String> {
+pub(crate) fn parse_stm32flash_output(s: &str) -> Stm32FlashInfo {
     // Typical successful output (one field per line, ':' separator):
     //   Version      : 0x22
     //   Option 1     : 0x00
@@ -94,17 +139,7 @@ pub(crate) fn parse_stm32flash_output(s: &str) -> HashMap<String, String> {
     //   - Flash      : Up to 512KiB (size first sector: 4x2048)
     //   - Option RAM : 16b
     //   - System RAM : 2KiB
-    let mut info = HashMap::new();
-    let interesting = [
-        "Version",
-        "Option 1",
-        "Option 2",
-        "Device ID",
-        "RAM",
-        "Flash",
-        "Option RAM",
-        "System RAM",
-    ];
+    let mut info = Stm32FlashInfo::default();
     for raw in s.lines() {
         // Strip leading '- ' (used for RAM/Flash/Option RAM/System RAM rows).
         let line = raw.trim().trim_start_matches('-').trim();
@@ -112,29 +147,19 @@ pub(crate) fn parse_stm32flash_output(s: &str) -> HashMap<String, String> {
             continue;
         }
         if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            if interesting.contains(&key) {
-                info.insert(key.to_string(), v.trim().to_string());
+            let val = v.trim().to_string();
+            match k.trim() {
+                "Version" => info.version = Some(val),
+                "Option 1" => info.option_1 = Some(val),
+                "Option 2" => info.option_2 = Some(val),
+                "Device ID" => info.device_id = Some(val),
+                "RAM" => info.ram = Some(val),
+                "Flash" => info.flash = Some(val),
+                "Option RAM" => info.option_ram = Some(val),
+                "System RAM" => info.system_ram = Some(val),
+                _ => {}
             }
         }
     }
     info
-}
-pub(crate) fn print_stm32_info(info: &HashMap<String, String>, board_name: &str) {
-    println!("  {:<20} {}", "Bridge:", board_name);
-    let order = [
-        ("Device ID",  "Device ID"),
-        ("Flash",      "Flash"),
-        ("RAM",        "RAM"),
-        ("System RAM", "System ROM"),
-        ("Option RAM", "Option RAM"),
-        ("Option 1",   "Option byte 1"),
-        ("Option 2",   "Option byte 2"),
-        ("Version",    "Bootloader ver"),
-    ];
-    for (key, label) in order {
-        if let Some(v) = info.get(key) {
-            println!("  {:<20} {}", format!("{label}:"), v);
-        }
-    }
 }

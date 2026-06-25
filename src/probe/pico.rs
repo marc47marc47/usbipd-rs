@@ -34,7 +34,100 @@ pub(crate) fn find_picotool() -> PathBuf {
     PathBuf::from("picotool")
 }
 
-pub(crate) fn run_picotool_info(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+/// Parsed `picotool info -a` output. picotool emits a wide, open-ended set of
+/// `key: value` rows; we keep the recognized ones (others are ignored, as the
+/// original printer did) and render them in a fixed grouped order.
+#[derive(Default)]
+pub(crate) struct PicoInfo {
+    pub(crate) chip: Option<String>,
+    pub(crate) chip_revision: Option<String>,
+    pub(crate) package: Option<String>,
+    pub(crate) chip_id: Option<String>,
+    pub(crate) unique_id: Option<String>,
+    pub(crate) flash_size: Option<String>,
+    pub(crate) flash_devinfo: Option<String>,
+    pub(crate) rom_version: Option<String>,
+    pub(crate) rom_gitrev: Option<String>,
+    pub(crate) default_cpu: Option<String>,
+    pub(crate) current_cpu: Option<String>,
+    pub(crate) available_cpus: Option<String>,
+    pub(crate) boot_type: Option<String>,
+    pub(crate) last_booted_partition: Option<String>,
+    pub(crate) secure_boot: Option<String>,
+    pub(crate) debug_enable: Option<String>,
+    pub(crate) secure_debug_enable: Option<String>,
+    pub(crate) boot_random: Option<String>,
+    pub(crate) boot2_name: Option<String>,
+    pub(crate) program_name: Option<String>,
+    pub(crate) program_desc: Option<String>,
+    pub(crate) features: Option<String>,
+    pub(crate) sdk_version: Option<String>,
+    pub(crate) pico_board: Option<String>,
+    pub(crate) binary_start: Option<String>,
+    pub(crate) binary_end: Option<String>,
+    pub(crate) build_date: Option<String>,
+    pub(crate) build_attributes: Option<String>,
+    pub(crate) build_id: Option<String>,
+    pub(crate) embedded_drive: Option<String>,
+}
+
+impl PicoInfo {
+    /// `(label, value, decode-as-flash-devinfo)` rows in display order.
+    fn rows(&self) -> [(&'static str, &Option<String>, bool); 30] {
+        [
+            ("Chip", &self.chip, false),
+            ("Chip revision", &self.chip_revision, false),
+            ("Package", &self.package, false),
+            ("Chip ID", &self.chip_id, false),
+            ("Unique ID", &self.unique_id, false),
+            ("Flash size", &self.flash_size, false),
+            ("Flash devinfo", &self.flash_devinfo, true),
+            ("ROM version", &self.rom_version, false),
+            ("ROM gitrev", &self.rom_gitrev, false),
+            ("Default CPU", &self.default_cpu, false),
+            ("Current CPU", &self.current_cpu, false),
+            ("Available CPUs", &self.available_cpus, false),
+            ("Boot type", &self.boot_type, false),
+            ("Last booted part", &self.last_booted_partition, false),
+            ("Secure boot", &self.secure_boot, false),
+            ("Debug enable", &self.debug_enable, false),
+            ("Secure debug", &self.secure_debug_enable, false),
+            ("Boot random", &self.boot_random, false),
+            ("Boot2 stage", &self.boot2_name, false),
+            ("Program name", &self.program_name, false),
+            ("Program desc", &self.program_desc, false),
+            ("Features", &self.features, false),
+            ("SDK version", &self.sdk_version, false),
+            ("pico_board", &self.pico_board, false),
+            ("Binary start", &self.binary_start, false),
+            ("Binary end", &self.binary_end, false),
+            ("Build date", &self.build_date, false),
+            ("Build attrs", &self.build_attributes, false),
+            ("Build ID", &self.build_id, false),
+            ("Embedded drive", &self.embedded_drive, false),
+        ]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows().iter().all(|(_, v, _)| v.is_none())
+    }
+
+    pub(crate) fn print(&self, board_name: &str) {
+        println!("  {:<20} {}", "Board:", board_name);
+        for (label, val, is_devinfo) in self.rows() {
+            if let Some(v) = val {
+                let display_value = if is_devinfo {
+                    format!("{} ({})", v, decode_flash_devinfo(v))
+                } else {
+                    v.clone()
+                };
+                println!("  {:<20} {}", format!("{label}:"), display_value);
+            }
+        }
+    }
+}
+
+pub(crate) fn run_picotool_info(vid: u16, pid: u16) -> Result<PicoInfo> {
     let picotool = find_picotool();
     let vid_hex = format!("0x{vid:04x}");
     let pid_hex = format!("0x{pid:04x}");
@@ -79,8 +172,8 @@ pub(crate) fn run_picotool_info(vid: u16, pid: u16) -> Result<HashMap<String, St
     Ok(parse_picotool_output(&stdout))
 }
 
-pub(crate) fn parse_picotool_output(s: &str) -> HashMap<String, String> {
-    let mut info = HashMap::new();
+pub(crate) fn parse_picotool_output(s: &str) -> PicoInfo {
+    let mut info = PicoInfo::default();
     for raw in s.lines() {
         let line = raw.trim();
         if line.is_empty() {
@@ -90,62 +183,45 @@ pub(crate) fn parse_picotool_output(s: &str) -> HashMap<String, String> {
         let Some(idx) = line.find(':') else { continue };
         let key = line[..idx].trim();
         let value = line[idx + 1..].trim();
-        if !key.is_empty() && !value.is_empty() && value != "none" {
-            info.insert(key.to_string(), value.to_string());
+        if key.is_empty() || value.is_empty() || value == "none" {
+            continue;
+        }
+        let value = value.to_string();
+        match key {
+            "type" => info.chip = Some(value),
+            "revision" => info.chip_revision = Some(value),
+            "package" => info.package = Some(value),
+            "chipid" => info.chip_id = Some(value),
+            "unique id" => info.unique_id = Some(value),
+            "flash size" => info.flash_size = Some(value),
+            "flash devinfo" => info.flash_devinfo = Some(value),
+            "ROM version" => info.rom_version = Some(value),
+            "rom gitrev" => info.rom_gitrev = Some(value),
+            "default cpu" => info.default_cpu = Some(value),
+            "current cpu" => info.current_cpu = Some(value),
+            "available cpus" => info.available_cpus = Some(value),
+            "boot type" => info.boot_type = Some(value),
+            "last booted partition" => info.last_booted_partition = Some(value),
+            "secure boot" => info.secure_boot = Some(value),
+            "debug enable" => info.debug_enable = Some(value),
+            "secure debug enable" => info.secure_debug_enable = Some(value),
+            "boot_random" => info.boot_random = Some(value),
+            "boot2 name" => info.boot2_name = Some(value),
+            "name" => info.program_name = Some(value),
+            "description" => info.program_desc = Some(value),
+            "features" => info.features = Some(value),
+            "sdk version" => info.sdk_version = Some(value),
+            "pico_board" => info.pico_board = Some(value),
+            "binary start" => info.binary_start = Some(value),
+            "binary end" => info.binary_end = Some(value),
+            "build date" => info.build_date = Some(value),
+            "build attributes" => info.build_attributes = Some(value),
+            "build id" => info.build_id = Some(value),
+            "embedded drive" => info.embedded_drive = Some(value),
+            _ => {}
         }
     }
     info
-}
-
-pub(crate) fn print_pico_info(info: &HashMap<String, String>, board_name: &str) {
-    println!("  {:<20} {}", "Board:", board_name);
-    let order = [
-        // ── Silicon ──────────────────────────────────────────
-        ("type",                "Chip"),
-        ("revision",            "Chip revision"),
-        ("package",             "Package"),
-        ("chipid",              "Chip ID"),
-        ("unique id",           "Unique ID"),
-        // ── Flash ────────────────────────────────────────────
-        ("flash size",          "Flash size"),
-        ("flash devinfo",       "Flash devinfo"),
-        // ── Boot ROM / CPU ───────────────────────────────────
-        ("ROM version",         "ROM version"),
-        ("rom gitrev",          "ROM gitrev"),
-        ("default cpu",         "Default CPU"),
-        ("current cpu",         "Current CPU"),
-        ("available cpus",      "Available CPUs"),
-        ("boot type",           "Boot type"),
-        ("last booted partition","Last booted part"),
-        // ── Security / debug ────────────────────────────────
-        ("secure boot",         "Secure boot"),
-        ("debug enable",        "Debug enable"),
-        ("secure debug enable", "Secure debug"),
-        ("boot_random",         "Boot random"),
-        ("boot2 name",          "Boot2 stage"),
-        // ── Application info (if firmware present) ───────────
-        ("name",                "Program name"),
-        ("description",         "Program desc"),
-        ("features",            "Features"),
-        ("sdk version",         "SDK version"),
-        ("pico_board",          "pico_board"),
-        ("binary start",        "Binary start"),
-        ("binary end",          "Binary end"),
-        ("build date",          "Build date"),
-        ("build attributes",    "Build attrs"),
-        ("build id",            "Build ID"),
-        ("embedded drive",      "Embedded drive"),
-    ];
-    for (key, label) in order {
-        if let Some(v) = info.get(key) {
-            let display_value = if key == "flash devinfo" {
-                format!("{} ({})", v, decode_flash_devinfo(v))
-            } else {
-                v.clone()
-            };
-            println!("  {:<20} {}", format!("{label}:"), display_value);
-        }
-    }
 }
 
 pub(crate) fn decode_flash_devinfo(v: &str) -> String {

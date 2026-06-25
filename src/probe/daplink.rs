@@ -1,6 +1,68 @@
 use crate::*;
 
-pub(crate) fn run_daplink_query() -> Result<HashMap<String, String>> {
+/// DAPLink interface-firmware details read from the MSD `DETAILS.TXT`.
+#[derive(Default)]
+pub(crate) struct DaplinkInfo {
+    pub(crate) drive_letter: Option<String>,
+    pub(crate) unique_id: Option<String>,
+    pub(crate) hic_id: Option<String>,
+    pub(crate) daplink_mode: Option<String>,
+    pub(crate) interface_version: Option<String>,
+    pub(crate) bootloader_version: Option<String>,
+    pub(crate) git_sha: Option<String>,
+    pub(crate) local_mods: Option<String>,
+    pub(crate) usb_interfaces: Option<String>,
+    pub(crate) auto_reset: Option<String>,
+    pub(crate) automation_allowed: Option<String>,
+    pub(crate) overflow_detection: Option<String>,
+    pub(crate) remount_count: Option<String>,
+    pub(crate) url: Option<String>,
+}
+
+impl DaplinkInfo {
+    fn rows(&self) -> [(&'static str, &Option<String>); 14] {
+        [
+            ("MSD mount", &self.drive_letter),
+            ("Unique ID", &self.unique_id),
+            ("HIC ID", &self.hic_id),
+            ("DAPLink mode", &self.daplink_mode),
+            ("Interface FW", &self.interface_version),
+            ("Bootloader FW", &self.bootloader_version),
+            ("DAPLink commit", &self.git_sha),
+            ("Local mods", &self.local_mods),
+            ("USB interfaces", &self.usb_interfaces),
+            ("Auto reset", &self.auto_reset),
+            ("Automation", &self.automation_allowed),
+            ("Overflow det.", &self.overflow_detection),
+            ("Remount count", &self.remount_count),
+            ("Board URL", &self.url),
+        ]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows().iter().all(|(_, v)| v.is_none())
+    }
+
+    pub(crate) fn print(&self, board_name: &str) {
+        println!("  {:<20} {}", "Board:", board_name);
+        for (label, v) in self.rows() {
+            if let Some(v) = v {
+                println!("  {:<20} {}", format!("{label}:"), v);
+            }
+        }
+
+        // Identify the specific board variant from Unique ID prefix and surface
+        // the underlying target chip, since DAPLink itself is just the interface.
+        if let Some(uid) = &self.unique_id {
+            if let Some((variant, target)) = microbit_identify(uid) {
+                println!("  {:<20} {}", "Variant:", variant);
+                println!("  {:<20} {}", "Target chip:", target);
+            }
+        }
+    }
+}
+
+pub(crate) fn run_daplink_query() -> Result<DaplinkInfo> {
     let drive = find_daplink_drive().context(
         "DAPLink mass storage drive not found. \
          Check that the device shows up as a USB drive and DETAILS.TXT exists at its root.",
@@ -9,7 +71,7 @@ pub(crate) fn run_daplink_query() -> Result<HashMap<String, String>> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Could not read {}", path.display()))?;
     let mut info = parse_daplink_details(&content);
-    info.insert("Drive letter".to_string(), drive.to_string_lossy().into_owned());
+    info.drive_letter = Some(drive.to_string_lossy().into_owned());
     Ok(info)
 }
 
@@ -60,8 +122,8 @@ pub(crate) fn scan_mount_children(root: &Path) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn parse_daplink_details(s: &str) -> HashMap<String, String> {
-    let mut info = HashMap::new();
+pub(crate) fn parse_daplink_details(s: &str) -> DaplinkInfo {
+    let mut info = DaplinkInfo::default();
     for raw in s.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -70,48 +132,76 @@ pub(crate) fn parse_daplink_details(s: &str) -> HashMap<String, String> {
         let Some((k, v)) = line.split_once(':') else { continue };
         let key = k.trim();
         let value = v.trim();
-        if !key.is_empty() && !value.is_empty() {
-            info.insert(key.to_string(), value.to_string());
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        let value = value.to_string();
+        match key {
+            "Unique ID" => info.unique_id = Some(value),
+            "HIC ID" => info.hic_id = Some(value),
+            "Daplink Mode" => info.daplink_mode = Some(value),
+            "Interface Version" => info.interface_version = Some(value),
+            "Bootloader Version" => info.bootloader_version = Some(value),
+            "Git SHA" => info.git_sha = Some(value),
+            "Local Mods" => info.local_mods = Some(value),
+            "USB Interfaces" => info.usb_interfaces = Some(value),
+            "Auto Reset" => info.auto_reset = Some(value),
+            "Automation allowed" => info.automation_allowed = Some(value),
+            "Overflow detection" => info.overflow_detection = Some(value),
+            "Remount count" => info.remount_count = Some(value),
+            "URL" => info.url = Some(value),
+            _ => {}
         }
     }
     info
 }
 
-pub(crate) fn print_daplink_info(info: &HashMap<String, String>, board_name: &str) {
-    println!("  {:<20} {}", "Board:", board_name);
-    let order = [
-        ("Drive letter",       "MSD mount"),
-        ("Unique ID",          "Unique ID"),
-        ("HIC ID",             "HIC ID"),
-        ("Daplink Mode",       "DAPLink mode"),
-        ("Interface Version",  "Interface FW"),
-        ("Bootloader Version", "Bootloader FW"),
-        ("Git SHA",            "DAPLink commit"),
-        ("Local Mods",         "Local mods"),
-        ("USB Interfaces",     "USB interfaces"),
-        ("Auto Reset",         "Auto reset"),
-        ("Automation allowed", "Automation"),
-        ("Overflow detection", "Overflow det."),
-        ("Remount count",      "Remount count"),
-        ("URL",                "Board URL"),
-    ];
-    for (key, label) in order {
-        if let Some(v) = info.get(key) {
-            println!("  {:<20} {}", format!("{label}:"), v);
-        }
+/// pyocd probe/board identity from `pyocd json --probes` (no SWD connect/reset).
+#[derive(Default)]
+pub(crate) struct PyocdInfo {
+    pub(crate) vendor_name: Option<String>,
+    pub(crate) product_name: Option<String>,
+    pub(crate) unique_id: Option<String>,
+    pub(crate) board_vendor: Option<String>,
+    pub(crate) board_name: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) info: Option<String>,
+    pub(crate) usb_filter: Option<String>,
+}
+
+impl PyocdInfo {
+    fn rows(&self) -> [(&'static str, &Option<String>); 8] {
+        [
+            ("Probe vendor", &self.vendor_name),
+            ("Probe product", &self.product_name),
+            ("Probe unique ID", &self.unique_id),
+            ("Board vendor", &self.board_vendor),
+            ("Board name", &self.board_name),
+            ("Target chip", &self.target),
+            ("Combined", &self.info),
+            ("USB VID:PID", &self.usb_filter),
+        ]
     }
 
-    // Identify the specific board variant from Unique ID prefix and surface
-    // the underlying target chip, since DAPLink itself is just the interface.
-    if let Some(uid) = info.get("Unique ID") {
-        if let Some((variant, target)) = microbit_identify(uid) {
-            println!("  {:<20} {}", "Variant:", variant);
-            println!("  {:<20} {}", "Target chip:", target);
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows().iter().all(|(_, v)| v.is_none())
+    }
+
+    pub(crate) fn print(&self) {
+        let mut printed_any = false;
+        for (label, v) in self.rows() {
+            if let Some(v) = v {
+                println!("  {:<20} {}", format!("{label}:"), v);
+                printed_any = true;
+            }
+        }
+        if !printed_any {
+            println!("  (pyocd returned no probe info — is the device still in the same port?)");
         }
     }
 }
 
-pub(crate) fn run_pyocd_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+pub(crate) fn run_pyocd_query(vid: u16, pid: u16) -> Result<PyocdInfo> {
     // Use `pyocd json --probes` for stable parseable output (vs. the table form
     // of `pyocd list -p`). This does NOT connect to or reset the SWD target —
     // chip identity comes from pyocd's internal board database keyed by USB
@@ -140,7 +230,7 @@ pub(crate) fn run_pyocd_query(vid: u16, pid: u16) -> Result<HashMap<String, Stri
     Ok(parse_pyocd_output(&stdout, vid, pid))
 }
 
-pub(crate) fn parse_pyocd_output(s: &str, vid: u16, pid: u16) -> HashMap<String, String> {
+pub(crate) fn parse_pyocd_output(s: &str, vid: u16, pid: u16) -> PyocdInfo {
     // pyocd JSON shape:
     //   { "boards": [ { "unique_id": "...", "info": "...",
     //                   "board_vendor": "...", "board_name": "...",
@@ -150,23 +240,17 @@ pub(crate) fn parse_pyocd_output(s: &str, vid: u16, pid: u16) -> HashMap<String,
     // We want fields from the first board entry. JSON parsing is small enough
     // here that adding serde_json isn't worth the compile-time cost — extract
     // each "key": "value" pair by string search.
-    let mut info = HashMap::new();
-    info.insert("USB filter".to_string(), format!("{:04x}:{:04x}", vid, pid));
-
-    let keys = [
-        "unique_id",
-        "info",
-        "board_vendor",
-        "board_name",
-        "target",
-        "vendor_name",
-        "product_name",
-    ];
-    for key in keys {
-        if let Some(v) = extract_json_string(s, key) {
-            info.insert(key.to_string(), v);
-        }
-    }
+    let mut info = PyocdInfo {
+        usb_filter: Some(format!("{:04x}:{:04x}", vid, pid)),
+        ..Default::default()
+    };
+    info.unique_id = extract_json_string(s, "unique_id");
+    info.info = extract_json_string(s, "info");
+    info.board_vendor = extract_json_string(s, "board_vendor");
+    info.board_name = extract_json_string(s, "board_name");
+    info.target = extract_json_string(s, "target");
+    info.vendor_name = extract_json_string(s, "vendor_name");
+    info.product_name = extract_json_string(s, "product_name");
     info
 }
 
@@ -191,27 +275,3 @@ pub(crate) fn extract_json_string(json: &str, key: &str) -> Option<String> {
     }
     None
 }
-
-pub(crate) fn print_pyocd_info(info: &HashMap<String, String>) {
-    let order = [
-        ("vendor_name",  "Probe vendor"),
-        ("product_name", "Probe product"),
-        ("unique_id",    "Probe unique ID"),
-        ("board_vendor", "Board vendor"),
-        ("board_name",   "Board name"),
-        ("target",       "Target chip"),
-        ("info",         "Combined"),
-        ("USB filter",   "USB VID:PID"),
-    ];
-    let mut printed_any = false;
-    for (key, label) in order {
-        if let Some(v) = info.get(key) {
-            println!("  {:<20} {}", format!("{label}:"), v);
-            printed_any = true;
-        }
-    }
-    if !printed_any {
-        println!("  (pyocd returned no probe info — is the device still in the same port?)");
-    }
-}
-

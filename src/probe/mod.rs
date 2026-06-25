@@ -12,40 +12,44 @@ pub(crate) struct ProbeCtx<'a> {
 /// probe means adding a variant here plus an arm in `ProbeKind::run` and
 /// `ProbeReport::print` — no scattered match sites elsewhere.
 pub(crate) enum ProbeReport {
-    Esp(HashMap<String, String>),
-    Avr(HashMap<String, String>),
-    Stm32Flash(HashMap<String, String>),
-    Dfu(HashMap<String, String>),
-    Ftdi(HashMap<String, String>),
-    Pico(HashMap<String, String>),
-    Daplink(HashMap<String, String>),
-    Pyocd(HashMap<String, String>),
+    Esp(EspInfo),
+    Avr(AvrInfo),
+    Stm32Flash(Stm32FlashInfo),
+    Dfu(DfuInfo),
+    Ftdi(FtdiInfo),
+    Pico(PicoInfo),
+    Daplink(DaplinkInfo),
+    Pyocd(PyocdInfo),
     StlinkController(StlinkControllerInfo),
     Target(TargetReport),
 }
 
 impl ProbeReport {
     pub(crate) fn is_empty(&self) -> bool {
-        use ProbeReport::*;
         match self {
-            Esp(m) | Avr(m) | Stm32Flash(m) | Dfu(m) | Ftdi(m) | Pico(m) | Daplink(m) | Pyocd(m) => {
-                m.is_empty()
-            }
-            StlinkController(i) => i.is_empty(),
-            Target(t) => t.is_empty(),
+            ProbeReport::Esp(i) => i.is_empty(),
+            ProbeReport::Avr(i) => i.is_empty(),
+            ProbeReport::Stm32Flash(i) => i.is_empty(),
+            ProbeReport::Dfu(i) => i.is_empty(),
+            ProbeReport::Ftdi(i) => i.is_empty(),
+            ProbeReport::Pico(i) => i.is_empty(),
+            ProbeReport::Daplink(i) => i.is_empty(),
+            ProbeReport::Pyocd(i) => i.is_empty(),
+            ProbeReport::StlinkController(i) => i.is_empty(),
+            ProbeReport::Target(t) => t.is_empty(),
         }
     }
 
     pub(crate) fn print(&self, board: &str) {
         match self {
-            ProbeReport::Esp(m) => print_esp_info(m),
-            ProbeReport::Avr(m) => print_avr_info(m, board),
-            ProbeReport::Stm32Flash(m) => print_stm32_info(m, board),
-            ProbeReport::Dfu(m) => print_dfu_info(m, board),
-            ProbeReport::Ftdi(m) => print_ftdi_info(m, board),
-            ProbeReport::Pico(m) => print_pico_info(m, board),
-            ProbeReport::Daplink(m) => print_daplink_info(m, board),
-            ProbeReport::Pyocd(m) => print_pyocd_info(m),
+            ProbeReport::Esp(i) => i.print(),
+            ProbeReport::Avr(i) => i.print(board),
+            ProbeReport::Stm32Flash(i) => i.print(board),
+            ProbeReport::Dfu(i) => i.print(board),
+            ProbeReport::Ftdi(i) => i.print(board),
+            ProbeReport::Pico(i) => i.print(board),
+            ProbeReport::Daplink(i) => i.print(board),
+            ProbeReport::Pyocd(i) => i.print(),
             ProbeReport::StlinkController(i) => i.print(),
             ProbeReport::Target(t) => t.print(board),
         }

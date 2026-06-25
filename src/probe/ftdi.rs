@@ -1,6 +1,42 @@
 use crate::*;
 
-pub(crate) fn run_ftdi_info(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+/// FTDI bridge descriptor info read read-only from nusb's cached enumeration.
+#[derive(Default)]
+pub(crate) struct FtdiInfo {
+    pub(crate) vidpid: Option<String>,
+    pub(crate) manufacturer: Option<String>,
+    pub(crate) product: Option<String>,
+    pub(crate) serial_number: Option<String>,
+    pub(crate) chip_variant: Option<String>,
+    pub(crate) interfaces: Option<String>,
+    pub(crate) driver: Option<String>,
+}
+
+impl FtdiInfo {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.vidpid.is_none() && self.chip_variant.is_none()
+    }
+
+    pub(crate) fn print(&self, board_name: &str) {
+        println!("  {:<20} {}", "Board:", board_name);
+        let rows: [(&str, &Option<String>); 7] = [
+            ("Manufacturer", &self.manufacturer),
+            ("Product", &self.product),
+            ("Serial number", &self.serial_number),
+            ("Chip variant", &self.chip_variant),
+            ("Interfaces", &self.interfaces),
+            ("Driver", &self.driver),
+            ("VID:PID", &self.vidpid),
+        ];
+        for (k, v) in rows {
+            if let Some(v) = v {
+                println!("  {:<20} {}", format!("{k}:"), v);
+            }
+        }
+    }
+}
+
+pub(crate) fn run_ftdi_info(vid: u16, pid: u16) -> Result<FtdiInfo> {
     // Pull cached descriptor info from nusb's enumeration — no device IO,
     // no chip reset, safe to chain before any serial probe. Windows caches
     // product/serial strings via setupapi, but not the manufacturer string
@@ -16,29 +52,22 @@ pub(crate) fn run_ftdi_info(vid: u16, pid: u16) -> Result<HashMap<String, String
             )
         })?;
 
-    let mut info = HashMap::new();
-    info.insert("VID:PID".into(), format!("{:04x}:{:04x}", vid, pid));
-    if let Some(m) = dev.manufacturer_string() {
-        info.insert("Manufacturer".into(), m.into());
-    }
-    if let Some(p) = dev.product_string() {
-        info.insert("Product".into(), p.into());
-    }
-    if let Some(s) = dev.serial_number() {
-        info.insert("Serial number".into(), s.into());
-    }
+    let mut info = FtdiInfo {
+        vidpid: Some(format!("{:04x}:{:04x}", vid, pid)),
+        manufacturer: dev.manufacturer_string().map(Into::into),
+        product: dev.product_string().map(Into::into),
+        serial_number: dev.serial_number().map(Into::into),
+        ..Default::default()
+    };
 
     let bcd_dev = dev.device_version();
     let variant = ftdi_chip_variant(pid, bcd_dev);
     let bcd_str = format!("0x{bcd_dev:04x}");
-    info.insert(
-        "Chip variant".into(),
-        if variant.is_empty() {
-            format!("bcdDevice {bcd_str}")
-        } else {
-            format!("{variant} (bcdDevice {bcd_str})")
-        },
-    );
+    info.chip_variant = Some(if variant.is_empty() {
+        format!("bcdDevice {bcd_str}")
+    } else {
+        format!("{variant} (bcdDevice {bcd_str})")
+    });
 
     // Windows: only populated for composite devices bound to usbccgp. An
     // FT232R bound straight to ftdibus reports zero interfaces here — skip
@@ -58,7 +87,7 @@ pub(crate) fn run_ftdi_info(vid: u16, pid: u16) -> Result<HashMap<String, String
         })
         .collect();
     if !ifaces.is_empty() {
-        info.insert("Interfaces".into(), ifaces.join(", "));
+        info.interfaces = Some(ifaces.join(", "));
     }
 
     // Windows-only: which kernel driver currently owns the device. For FTDI
@@ -68,7 +97,7 @@ pub(crate) fn run_ftdi_info(vid: u16, pid: u16) -> Result<HashMap<String, String
     #[cfg(windows)]
     if let Some(drv) = dev.driver() {
         if !drv.is_empty() {
-            info.insert("Driver".into(), drv.into());
+            info.driver = Some(drv.into());
         }
     }
 
@@ -85,24 +114,6 @@ pub(crate) fn ftdi_chip_variant(pid: u16, bcd_device: u16) -> &'static str {
         (0x6001, 0x0400) => "FT232BM",
         (0x6001, 0x0600) => "FT232R / FT232RL",
         _ => "",
-    }
-}
-
-pub(crate) fn print_ftdi_info(info: &HashMap<String, String>, board_name: &str) {
-    println!("  {:<20} {}", "Board:", board_name);
-    let order = [
-        "Manufacturer",
-        "Product",
-        "Serial number",
-        "Chip variant",
-        "Interfaces",
-        "Driver",
-        "VID:PID",
-    ];
-    for k in order {
-        if let Some(v) = info.get(k) {
-            println!("  {:<20} {}", format!("{k}:"), v);
-        }
     }
 }
 

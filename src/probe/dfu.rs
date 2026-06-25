@@ -1,6 +1,51 @@
 use crate::*;
 
-pub(crate) fn run_dfu_info(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
+/// Aggregated `dfu-util -l` listing for one DFU device (all alt settings folded
+/// into one report). `memory_map` holds one `label: detail` line per region.
+#[derive(Default)]
+pub(crate) struct DfuInfo {
+    pub(crate) flash_size: Option<String>,
+    pub(crate) bcd_device: Option<String>,
+    pub(crate) serial_number: Option<String>,
+    pub(crate) alt_settings: Option<String>,
+    pub(crate) vidpid: Option<String>,
+    pub(crate) memory_map: Option<String>,
+}
+
+impl DfuInfo {
+    pub(crate) fn is_empty(&self) -> bool {
+        // `vidpid` is set only once at least one matching alt setting was seen.
+        self.vidpid.is_none()
+    }
+
+    pub(crate) fn print(&self, board_name: &str) {
+        println!("  {:<20} {}", "Board:", board_name);
+        let rows: [(&str, &Option<String>); 5] = [
+            ("Flash size", &self.flash_size),
+            ("bcdDevice", &self.bcd_device),
+            ("Serial number", &self.serial_number),
+            ("Alt settings", &self.alt_settings),
+            ("VID:PID", &self.vidpid),
+        ];
+        for (label, v) in rows {
+            if let Some(v) = v {
+                println!("  {:<20} {}", format!("{label}:"), v);
+            }
+        }
+        if let Some(mm) = &self.memory_map {
+            println!("  {:<20}", "Memory map:");
+            for region in mm.lines() {
+                println!("    - {region}");
+            }
+        }
+        println!(
+            "  {:<20} (DFU mode reports a generic 0483:DF11; the flash geometry above\n  {:<20}  identifies the STM32 family — exact part can't be read over DFU)",
+            "Note:", ""
+        );
+    }
+}
+
+pub(crate) fn run_dfu_info(vid: u16, pid: u16) -> Result<DfuInfo> {
     // `dfu-util -l` lists every DFU device's alt settings + DfuSe memory map
     // on stdout (the version banner goes to stderr). Read-only; no chip reset.
     let output = Command::new("dfu-util")
@@ -30,14 +75,14 @@ pub(crate) fn run_dfu_info(vid: u16, pid: u16) -> Result<HashMap<String, String>
     Ok(info)
 }
 
-pub(crate) fn parse_dfu_output(s: &str, vid: u16, pid: u16) -> HashMap<String, String> {
+pub(crate) fn parse_dfu_output(s: &str, vid: u16, pid: u16) -> DfuInfo {
     // Each matching line looks like:
     //   Found DFU: [0483:df11] ver=2200, devnum=5, cfg=1, intf=0, path="20-1.4",
     //              alt=0, name="@Internal Flash  /0x08000000/04*016Kg,01*064Kg,07*128Kg",
     //              serial="3576345C3137"
     // One line per alt setting; we aggregate them into a single report.
     let target = format!("[{:04x}:{:04x}]", vid, pid);
-    let mut info = HashMap::new();
+    let mut info = DfuInfo::default();
     let mut alt_count = 0u32;
     let mut regions: Vec<String> = Vec::new();
 
@@ -49,16 +94,20 @@ pub(crate) fn parse_dfu_output(s: &str, vid: u16, pid: u16) -> HashMap<String, S
         alt_count += 1;
 
         if let Some(v) = dfu_field(line, "ver") {
-            info.entry("bcdDevice".to_string()).or_insert(format!("0x{v}"));
+            if info.bcd_device.is_none() {
+                info.bcd_device = Some(format!("0x{v}"));
+            }
         }
         if let Some(v) = dfu_field(line, "serial") {
-            info.entry("Serial number".to_string()).or_insert(v);
+            if info.serial_number.is_none() {
+                info.serial_number = Some(v);
+            }
         }
         if let Some(name) = dfu_field(line, "name") {
             if let Some((label, detail, flash_kb)) = format_dfu_region(&name) {
                 regions.push(format!("{label}: {detail}"));
                 if let Some(kb) = flash_kb {
-                    info.insert("Flash size".to_string(), format!("{kb} KB"));
+                    info.flash_size = Some(format!("{kb} KB"));
                 }
             }
         }
@@ -67,10 +116,10 @@ pub(crate) fn parse_dfu_output(s: &str, vid: u16, pid: u16) -> HashMap<String, S
     if alt_count == 0 {
         return info;
     }
-    info.insert("VID:PID".to_string(), format!("{:04x}:{:04x}", vid, pid));
-    info.insert("Alt settings".to_string(), alt_count.to_string());
+    info.vidpid = Some(format!("{:04x}:{:04x}", vid, pid));
+    info.alt_settings = Some(alt_count.to_string());
     if !regions.is_empty() {
-        info.insert("Memory map".to_string(), regions.join("\n"));
+        info.memory_map = Some(regions.join("\n"));
     }
     info
 }
@@ -133,30 +182,3 @@ pub(crate) fn dfu_region_size_kb(layout: &str) -> Option<u64> {
     }
     Some(total_bytes / 1024)
 }
-
-pub(crate) fn print_dfu_info(info: &HashMap<String, String>, board_name: &str) {
-    println!("  {:<20} {}", "Board:", board_name);
-    let order = [
-        ("Flash size",    "Flash size"),
-        ("bcdDevice",     "bcdDevice"),
-        ("Serial number", "Serial number"),
-        ("Alt settings",  "Alt settings"),
-        ("VID:PID",       "VID:PID"),
-    ];
-    for (key, label) in order {
-        if let Some(v) = info.get(key) {
-            println!("  {:<20} {}", format!("{label}:"), v);
-        }
-    }
-    if let Some(mm) = info.get("Memory map") {
-        println!("  {:<20}", "Memory map:");
-        for region in mm.lines() {
-            println!("    - {region}");
-        }
-    }
-    println!(
-        "  {:<20} (DFU mode reports a generic 0483:DF11; the flash geometry above\n  {:<20}  identifies the STM32 family — exact part can't be read over DFU)",
-        "Note:", ""
-    );
-}
-
