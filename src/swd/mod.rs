@@ -142,3 +142,26 @@ pub mod stlink;
 pub mod cmsisdap;
 pub(crate) use stlink::*;
 pub(crate) use cmsisdap::*;
+pub mod cmsisdap_query;
+pub(crate) use cmsisdap_query::*;
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn format_target_rows_keeps_gd32_name_over_builtin_stm32() {
+        // The full layer-2 path (ST-Link / CMSIS-DAP): decode names the GD32, and
+        // the resolved built-in STM32 high-density entry must NOT clobber it.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x412FC231]);
+        regs.insert(0xE0042000, vec![0x13090414]); // DEV_ID 0x414, clone REV_ID 0x1309
+        regs.insert(0x1FFFF7E0, vec![512]); // 512 KB → xE
+        let resolved = resolve_chip(0x414, &[]).expect("0x414 resolves to built-in STM32");
+        let report = format_target_rows(&regs, Some(0x414), Some(&resolved));
+        let dev = report.device_id.as_deref().unwrap();
+        assert!(dev.contains("GD32F103xE") && dev.contains("GD32F103RET6"));
+        assert!(!dev.contains("STM32"));
+        assert!(report.vendor.as_deref().is_some_and(|v| v.contains("GigaDevice")));
+    }
+}

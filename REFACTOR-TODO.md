@@ -107,8 +107,13 @@
 - `--help`/`--list-tools`/`--list` 與基準逐字 IDENTICAL（`--probe` 在 probe 仍接著時亦 IDENTICAL；
   中途 CMSIS-DAP probe 被實體拔除後，硬體路徑改以單元測試 + 邏輯保真把關）。
 
-### 已知小偏差
-- `src/swd/cmsisdap.rs` = 506 行（略過 500）：型別化後的 TargetReport 結構建構比 HashMap 略長。
-  要降到 500 以下需把 run_cmsisdap_* 查詢移出並把多個 CmsisDapLink 方法改 pub(crate) 跨模組，
-  風險高於收益，故保留。其餘所有檔案 < 500。
-- 測試仍集中於 `lib.rs` root（未逐一拆入各模組）；被測私有欄位/方法已補 pub(crate)。
+### 收尾（前述兩項偏差皆已解決）
+- ✅ `swd/cmsisdap.rs` 拆出查詢層 `swd/cmsisdap_query.rs`（run_cmsisdap_* + rp2040_rows），
+  link 協定檔降為 346 行。**所有檔案現在皆 < 500 行**（最大 windows/mod.rs 446）。
+- ✅ 測試已逐一拆入各自模組（`#[cfg(test)] mod tests`，`use crate::*`）：
+  controller→stlink、decode→stm32/decode、chipdb→stm32/chipdb、gd32→stm32/mod、
+  le_u32→swd/stlink、format_target_rows→swd/mod、cmsisdap→swd/cmsisdap、
+  driver/classify/advice/instance_vidpid/driverstore→windows/mod。`lib.rs` 縮到 62 行。
+  22 測試全通過。
+- 實機複驗（probe 重新接上後）：controller 輸出與基準逐字相同；target 的 TargetReport
+  正確渲染（Probe/DP IDCODE/Layer 2 列）。

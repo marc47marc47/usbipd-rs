@@ -225,3 +225,21 @@ pub(crate) fn run_stlink_controller_query(vid: u16, pid: u16) -> Result<StlinkCo
     Ok(info)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn stlink_v2_1_profile_describes_the_usb_controller_not_the_target() {
+        let profile = stlink_controller_profile(0x374b).expect("known ST-Link/V2-1 PID");
+
+        assert_eq!(profile.controller_mcu, "STM32F103CBT6");
+        assert_eq!(profile.core, "Arm Cortex-M3");
+        assert_eq!(profile.flash, "128 KB");
+        assert_eq!(profile.sram, "20 KB");
+        assert_eq!(profile.flash_map, "0x08000000-0x0801FFFF");
+        assert!(profile.self_debug.contains("external probe required"));
+        assert!(profile.downstream.starts_with("SWD"));
+    }
+}

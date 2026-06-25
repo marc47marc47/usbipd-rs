@@ -155,3 +155,20 @@ pub mod chipdb;
 pub mod decode;
 pub(crate) use chipdb::*;
 pub(crate) use decode::*;
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn gd32_density_maps_flash_to_letter() {
+        assert_eq!(gd32_density(Some(512)), "xE");
+        assert_eq!(gd32_density(Some(256)), "xC");
+        assert_eq!(gd32_density(Some(64)), "x8");
+        assert_eq!(gd32_density(None), "");
+        // Non-clone REV_ID → no GD32 identity even on a GD32 DEV_ID.
+        assert!(gd32_identify(0x414, 0x1000, Some(512)).is_none());
+        // Clone REV_ID on an untracked DEV_ID → no model (generic clone flag only).
+        assert!(gd32_identify(0x412, 0x9999, Some(64)).is_none());
+    }
+}

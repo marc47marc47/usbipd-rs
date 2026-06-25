@@ -147,3 +147,78 @@ pub(crate) fn resolve_chip(dev_id: u16, db: &[ChipDef]) -> Option<ResolvedChip> 
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn chip_file_parses_stlink_format() {
+        let text = "\
+# comment line
+dev_type STM32F446
+chip_id 0x421                // STM32_CHIPID_F446
+flash_type F2_F4
+flash_size_reg 0x1fff7a22
+sram_size 0x20000            // 128 KB
+option_base 0x40023c14
+";
+        let def = parse_chip_file(text).expect("has chip_id");
+        assert_eq!(def.dev_id, 0x421);
+        assert_eq!(def.name, "STM32F446");
+        assert_eq!(def.flash_size_addr, Some(0x1FFF7A22));
+        assert_eq!(def.sram_kb, Some(128));
+        assert!(parse_chip_file("dev_type Foo\n").is_none()); // no chip_id
+    }
+
+    #[test]
+    fn chip_int_accepts_hex_and_decimal() {
+        assert_eq!(parse_chip_int("0x20000"), Some(0x20000));
+        assert_eq!(parse_chip_int("0X10"), Some(16));
+        assert_eq!(parse_chip_int("512"), Some(512));
+        assert_eq!(parse_chip_int("0x421,"), Some(0x421)); // trailing punctuation
+    }
+
+    #[test]
+    fn resolve_chip_falls_back_to_builtin_when_no_file() {
+        let r = resolve_chip(0x421, &[]).expect("F446 is built-in");
+        assert!(r.name.contains("STM32F446"));
+        assert_eq!(r.flash_size_addr, Some(0x1FFF7A22));
+        assert_eq!(r.uid_addr, Some(0x1FFF7A10)); // verified built-in UID addr
+        assert_eq!(r.sram_kb, Some(128));
+        assert_eq!(r.source, "built-in");
+    }
+
+    #[test]
+    fn resolve_chip_file_overrides_builtin_but_keeps_verified_addrs() {
+        let db = vec![ChipDef {
+            dev_id: 0x421,
+            name: "My Custom F446 Board".to_string(),
+            flash_size_addr: Some(0x1FFF7A22),
+            sram_kb: Some(128),
+            source: "etc/chips/F446.chip".to_string(),
+        }];
+        let r = resolve_chip(0x421, &db).unwrap();
+        assert_eq!(r.name, "My Custom F446 Board"); // file name wins
+        assert_eq!(r.uid_addr, Some(0x1FFF7A10)); // UID still from built-in
+        assert_eq!(r.source, "etc/chips/F446.chip");
+    }
+
+    #[test]
+    fn resolve_chip_file_adds_a_part_unknown_to_builtin() {
+        let db = vec![ChipDef {
+            dev_id: 0x999,
+            name: "STM32 Experimental".to_string(),
+            flash_size_addr: Some(0x1FFF7A22),
+            sram_kb: Some(64),
+            source: "etc/chips/X.chip".to_string(),
+        }];
+        let r = resolve_chip(0x999, &db).expect("file-defined part resolves");
+        assert_eq!(r.name, "STM32 Experimental");
+        assert_eq!(r.flash_size_addr, Some(0x1FFF7A22));
+        assert_eq!(r.sram_kb, Some(64));
+        assert_eq!(r.uid_addr, None); // not in built-in → no UID/RDP
+        assert_eq!(r.rdp_addr, None);
+        assert!(resolve_chip(0x999, &[]).is_none()); // unknown without a file
+    }
+}

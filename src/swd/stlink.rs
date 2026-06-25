@@ -228,3 +228,17 @@ impl TargetLink for StlinkLink {
         self.read_debug_reg(addr)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn le_u32_reads_little_endian_at_offset() {
+        // ST-Link debug-reg / idcode responses place the 32-bit value at offset 4.
+        let resp = [0x80, 0x00, 0x00, 0x00, 0x41, 0x10, 0x00, 0x10];
+        assert_eq!(le_u32(&resp, 4), Some(0x10001041));
+        assert_eq!(le_u32(&resp, 0), Some(0x0000_0080));
+        assert_eq!(le_u32(&resp, 6), None); // out of bounds, no panic
+    }
+}

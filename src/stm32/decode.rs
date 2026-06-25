@@ -278,3 +278,80 @@ pub(crate) fn microbit_identify(unique_id: &str) -> Option<(&'static str, &'stat
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn layer2_decoder_identifies_stm32f446_without_writing_target() {
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x410FC241]);
+        regs.insert(0xE0042000, vec![0x10000421]);
+        regs.insert(0x1FFF7A22, vec![512]);
+        regs.insert(0x1FFF7A10, vec![0x11223344, 0x55667788, 0x99AABBCC]);
+        regs.insert(0x40023C14, vec![0x0000AA00]);
+
+        let info = decode_stlink_regs(&regs, Some(0x421));
+
+        assert!(info.device_id.as_deref().unwrap().contains("STM32F446"));
+        assert!(info.core.as_deref().unwrap().contains("Cortex-M4"));
+        assert_eq!(info.flash_size.as_deref(), Some("512 KB"));
+        assert_eq!(info.flash_map.as_deref(), Some("0x08000000-0x0807FFFF"));
+        assert!(info.read_protection.as_deref().unwrap().contains("Disabled"));
+        assert_eq!(info.access.as_deref(), Some("Read-only identity registers"));
+    }
+
+    #[test]
+    fn native_dbgmcu_idcode_decodes_to_stm32_family() {
+        // What --mcu-alive-native feeds decode_stlink_regs after reading DBGMCU.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x410FC241]); // CPUID: Cortex-M4
+        regs.insert(0xE0042000, vec![0x10010421]); // DBGMCU: DEV_ID 0x421 = F446
+        let info = decode_stlink_regs(&regs, Some(0x421));
+        assert!(info.device_id.as_deref().unwrap().contains("STM32F446"));
+        assert!(info.core.as_deref().unwrap().contains("Cortex-M4"));
+    }
+
+    #[test]
+    fn native_stm32f103_target_decodes_as_layer2() {
+        // A "Blue Pill" STM32F103C8 hanging off the probe (ST-Link or the RP2040
+        // CMSIS-DAP single-drop path): DEV_ID 0x410, Cortex-M3, 64 KB flash.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x412FC231]); // CPUID: Cortex-M3
+        regs.insert(0xE0042000, vec![0x20036410]); // DBGMCU: DEV_ID 0x410, REV_ID 0x2003
+        regs.insert(0x1FFFF7E0, vec![64]); // F1 flash-size register: 64 KB
+        let info = decode_stlink_regs(&regs, Some(0x410));
+        assert!(info.device_id.as_deref().unwrap().contains("STM32F1 medium-density"));
+        assert!(info.core.as_deref().unwrap().contains("Cortex-M3"));
+        assert_eq!(info.flash_size.as_deref(), Some("64 KB"));
+        assert!(info.revision.as_deref().unwrap().contains("rev 1/2/3/X/Y"));
+        assert!(info.vendor.is_none()); // genuine ST REV_ID → no clone flag
+    }
+
+    #[test]
+    fn gd32f103ret6_identified_as_gigadevice_not_stm32() {
+        // GD32F103RET6 mirrors ST's high-density DEV_ID 0x414 but reports a
+        // REV_ID (0x1309) outside ST's {0x1000,0x1001,0x1003} set; with 512 KB
+        // flash it resolves to the GD32F103xE density, named as GigaDevice.
+        let mut regs = HashMap::new();
+        regs.insert(0xE000ED00, vec![0x412FC231]); // Cortex-M3 r2p1
+        regs.insert(0xE0042000, vec![0x13090414]); // DBGMCU: DEV_ID 0x414, REV_ID 0x1309
+        regs.insert(0x1FFFF7E0, vec![512]); // F1 high-density flash-size word: 512 KB
+        let info = decode_stlink_regs(&regs, Some(0x414));
+        // Leads with the GD32 model, NOT the ST family name.
+        let device_id = info.device_id.as_deref().unwrap();
+        assert!(device_id.contains("GD32F103xE"));
+        assert!(device_id.contains("GD32F103RET6"));
+        assert!(!device_id.contains("STM32"));
+        assert!(info.max_clock.as_deref().unwrap().contains("108 MHz"));
+        let vendor = info.vendor.as_deref().expect("GD32 provenance noted");
+        assert!(vendor.contains("GigaDevice") && vendor.contains("0x1309"));
+
+        // A genuine high-density REV_ID must stay STM32 with no GD32 claim.
+        regs.insert(0xE0042000, vec![0x10000414]);
+        let genuine = decode_stlink_regs(&regs, Some(0x414));
+        assert!(genuine.device_id.as_deref().unwrap().contains("STM32F1 high-density"));
+        assert!(genuine.vendor.is_none());
+    }
+}

@@ -367,3 +367,80 @@ pub(crate) fn classify_driver_issue(node: &WindowsUsbDriverNode) -> Option<Drive
 
 pub mod status;
 pub(crate) use status::*;
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    fn node(status: &str, problem: &str, service: &str) -> WindowsUsbDriverNode {
+        let mut n = WindowsUsbDriverNode::default();
+        n.set_field("STATUS", status);
+        n.set_field("PROBLEM", problem);
+        n.set_field("SERVICE", service);
+        n
+    }
+
+    #[test]
+    fn healthy_node_has_no_issue() {
+        assert_eq!(classify_driver_issue(&node("OK", "0", "WINUSB")), None);
+        assert_eq!(classify_driver_issue(&node("OK", "", "usbccgp")), None);
+    }
+
+    #[test]
+    fn problem_28_without_service_is_a_missing_driver() {
+        // The real ST-Link MI_00 case: enumerated, code 28, no bound service.
+        assert_eq!(
+            classify_driver_issue(&node("Error", "28", "")),
+            Some(DriverIssue::MissingDriver)
+        );
+    }
+
+    #[test]
+    fn problem_28_with_service_is_a_load_failure_not_a_gap() {
+        assert_eq!(
+            classify_driver_issue(&node("Error", "28", "WINUSB")),
+            Some(DriverIssue::DriverLoadFailure)
+        );
+    }
+
+    #[test]
+    fn problem_codes_map_to_distinct_categories() {
+        assert_eq!(classify_driver_issue(&node("Error", "22", "x")), Some(DriverIssue::StoppedNode));
+        assert_eq!(classify_driver_issue(&node("Error", "39", "x")), Some(DriverIssue::DriverLoadFailure));
+        assert_eq!(classify_driver_issue(&node("Error", "52", "x")), Some(DriverIssue::SignatureFailure));
+        assert_eq!(classify_driver_issue(&node("Error", "43", "x")), Some(DriverIssue::Blocked));
+        assert_eq!(classify_driver_issue(&node("Error", "12", "x")), Some(DriverIssue::ResourceConflict));
+        assert_eq!(classify_driver_issue(&node("Error", "99", "x")), Some(DriverIssue::Unknown));
+    }
+
+    #[test]
+    fn stlink_mi00_advice_points_at_a_bundled_inf() {
+        let advice = known_driver_advice("USB\\VID_0483&PID_374B&MI_00\\7&abc&0&0000")
+            .expect("ST-Link MI_00 has known advice");
+        assert!(advice.name.contains("STSW-LINK009"));
+        assert_eq!(advice.local_inf, Some("windows-driver/stsw-link009/stlink_dbg_winusb.inf"));
+        // The healthy sibling interfaces must not match this binding.
+        assert!(known_driver_advice("USB\\VID_0483&PID_374B&MI_01\\x").is_none());
+    }
+
+    #[test]
+    fn instance_vidpid_parses_uppercase_and_lowercase() {
+        assert_eq!(instance_vidpid("USB\\VID_0483&PID_374B&MI_00\\x"), Some((0x0483, 0x374b)));
+        assert_eq!(instance_vidpid("usb\\vid_10c4&pid_ea60"), Some((0x10c4, 0xea60)));
+        assert_eq!(instance_vidpid("not-a-usb-id"), None);
+    }
+
+    #[test]
+    fn driverstore_parser_extracts_oem_name_for_matching_block() {
+        // Two blocks separated by a blank line; only the second mentions our INF.
+        let text = "Published Name: oem10.inf\r\nOriginal Name: usbser.inf\r\n\r\nPublished Name: oem42.inf\r\nOriginal Name: stlink_dbg_winusb.inf\r\nProvider: STMicroelectronics";
+        assert_eq!(parse_driverstore_oem(text, "stlink_dbg_winusb.inf"), vec!["oem42.inf"]);
+        assert!(parse_driverstore_oem(text, "absent.inf").is_empty());
+    }
+
+    #[test]
+    fn driverstore_parser_handles_lf_only_and_trailing_punctuation() {
+        let text = "Published Name: oem7.inf,\nOriginal Name: stlink_dbg_winusb.inf";
+        assert_eq!(parse_driverstore_oem(text, "STLINK_DBG_WINUSB.INF"), vec!["oem7.inf"]);
+    }
+}
