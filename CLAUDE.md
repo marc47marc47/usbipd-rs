@@ -17,21 +17,49 @@ cargo run --release -- --list-tools   # e.g. inspect installer status
 cargo test                            # unit tests (pure decoders/parsers/classifiers)
 ```
 
-The crate ships a `#[cfg(test)] mod tests` at the bottom of
-`src/bin/usbipd-rs.rs` covering the pure logic: ST-Link controller/target
-decoders, SWD failure classification, the driver-issue classifier
-(`classify_driver_issue`), driver advice/INF lookup, and the `pnputil`
-driver-store parser. Keep new pure helpers testable and add cases there.
-CI builds with `RUSTFLAGS: "-D warnings"`, so **`cargo build` must be
-warning-clean** or the GitHub Actions build fails.
+The crate ships a `#[cfg(test)] mod tests` at the bottom of `src/lib.rs`
+covering the pure logic: ST-Link controller/target decoders, SWD failure
+classification, the driver-issue classifier (`classify_driver_issue`), driver
+advice/INF lookup, and the `pnputil` driver-store parser. Keep new pure helpers
+testable and add cases there. CI builds with `RUSTFLAGS: "-D warnings"`, so
+**`cargo build` must be warning-clean** or the GitHub Actions build fails.
 
 `Cargo.lock` is gitignored; CI resolves dependencies fresh per run.
 
 ## Architecture
 
-All logic lives in one file: `src/bin/usbipd-rs.rs` (no `lib.rs`, no
-`src/main.rs`; the binary is declared via `[[bin]]` in `Cargo.toml`). It is
-two largely independent subsystems.
+The logic lives in a `usbipd_rs` **library crate** (`src/lib.rs` + submodules);
+`src/bin/usbipd-rs.rs` is a thin shim that calls `usbipd_rs::run()` (the binary
+is still declared via `[[bin]]` in `Cargo.toml`, so the output name is
+unchanged). `lib.rs` re-exports each module's items crate-wide
+(`pub(crate) use <mod>::*`) and submodules pull them back in with
+`use crate::*`, so intra-crate references resolve by bare name.
+
+Module map (each file is kept under ~500 lines):
+
+```
+src/lib.rs              run() dispatcher + crate-wide re-exports + #[cfg(test)] tests
+src/cli.rs              Cli enum + parse() (arg → command) + print_help
+src/boards.rs           AvrTarget, ProbeKind (+ run/label/tool_name), KnownBoard, KNOWN_BOARDS
+src/usb.rs              Entry, native nusb enumeration, table rendering, cmd_list_usb
+src/probe/             ProbeCtx, ProbeReport enum (dispatch), orchestrator, install suggestions,
+                        and one module per probe (esp/avr/stm32flash/ftdi/dfu/pico/daplink+pyocd),
+                        each owning its typed report struct + parse + print
+src/stm32/             stm_family/RdpKind/gd32 (mod), chipdb (.chip files), decode (TargetReport)
+src/stlink/            controller (StlinkControllerInfo), target query, driver (StlinkDriver)
+src/swd/               TargetLink trait + collect/format (mod), StlinkLink (stlink), CmsisDapLink (cmsisdap)
+src/windows/           WindowsUsbDriverNode + advice + DriverIssue (mod), driver status/install (status)
+src/cmd/               cmd_mcu_alive / cmd_mcu_alive_native
+src/installer/         Os/InstallStep/ToolSpec + install logic (mod), TOOLS table + URLs (tools)
+```
+
+Each probe `run_*` returns a typed report struct (e.g. `EspInfo`, `TargetReport`,
+`StlinkControllerInfo`) — there is no longer a `HashMap<String,String>` data
+flow. `ProbeKind::run` builds the matching `ProbeReport` variant and
+`ProbeReport::print` renders it, so adding a probe touches the `ProbeReport`
+enum plus those two methods, not scattered match sites.
+
+It is two largely independent subsystems.
 
 ### 1. USB listing + board probing (default command, `--probe`)
 
@@ -129,14 +157,19 @@ two largely independent subsystems.
 
 ## Extending
 
-- **New board:** add a `KnownBoard` entry to `KNOWN_BOARDS`. Reuse an existing
-  `ProbeKind` if possible; a new probe type needs a `ProbeKind` variant plus
-  its `run_*`/`print_*` functions and the match arm in `probe_boards()`.
-- **New installable tool:** add a `ToolSpec` to `TOOLS` (it then appears
-  automatically in `--list-tools`).
+- **New board:** add a `KnownBoard` entry to `KNOWN_BOARDS` (`boards.rs`). Reuse
+  an existing `ProbeKind` if possible. A new probe type needs: a `ProbeKind`
+  variant + arms in `ProbeKind::run`/`tool_name`/`label`, a typed report struct
+  with `is_empty`/`print` (in a `probe/*.rs` module), and a `ProbeReport` variant
+  wired into `ProbeReport::is_empty`/`print`. No other match sites.
+- **New installable tool:** add a `ToolSpec` to `TOOLS` (`installer/tools.rs`);
+  it then appears automatically in `--list-tools`.
 - **New debug probe:** add a `KnownBoard` with `STLINK` (ST-Link bulk) or
-  `CMSISDAP` (CMSIS-DAP v2) probes. Both feed the shared `collect_target_regs` /
-  `format_target_rows` layer-2 pipeline, so the downstream STM32 decode is reused.
+  `CMSISDAP` (CMSIS-DAP v2) probes. Both link types implement the `TargetLink`
+  trait and feed the shared `collect_target_regs` / `format_target_rows` →
+  `TargetReport` layer-2 pipeline, so the downstream STM32 decode is reused.
+- **New CLI flag:** add a `Cli` variant + a check in `cli::parse` (`cli.rs`) and
+  a match arm in `run()` (`lib.rs`).
 - **New STM32 model (native reader):** add a `dev_id` arm to `stm_family()`
   (and `builtin_sram_kb`) for a compiled-in entry, OR drop a `etc/chips/*.chip`
   file to add/override one without recompiling. Keep `etc/chips/*.chip`

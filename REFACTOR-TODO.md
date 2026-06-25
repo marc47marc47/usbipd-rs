@@ -36,6 +36,11 @@
 - [x] 2.10 `序` `installer/`（mod、tools 表）+ `cmd/mcu_alive.rs`
 - [x] 2.11 `序` 測試：暫保留於 `lib.rs` root（`mod tests`，super::* 解析 crate re-export；被測私有欄位/方法已補 pub(crate)），22 測試全綠。**偏離計畫**：未逐一拆入各模組，留待後續可選。
 
+## ✅ Phase 3 + 4.1/4.2 完成（HashMap<String,String> 已從全程式碼消除）
+> 註：依釐清的耦合，先做了 4.1/4.2（ProbeReport enum 派發），再逐一型別化各報告。
+> 所有 run_*/print_* 改用具名 struct + print 方法；ProbeReport 委派 is_empty/print。
+> 每步驗證：-D warnings 乾淨、22 測試通過、help/list-tools/list 輸出 IDENTICAL。
+
 ## Phase 3 — 型別化各報告（分拆後多檔，部分可並行）
 > 每項：新增報告 struct → `run_*` 回傳它 → `parse_*` 填它 → `print_*` 吃它。逐項驗證輸出不變。
 - [ ] 3.1 `序` `stm32/decode.rs`：`TargetReport` 取代 decode_stlink_regs 的 HashMap（含測試遷移）— 收益最大、先做
@@ -88,8 +93,22 @@
 2. 再逐一把變體的 payload 從 HashMap 換成具名 struct（原 3.1~3.9），每換一個比對輸出。
 3. 再做 CLI `Command` enum（4.3）與 SWD `TargetLink` trait（5）。
 
-## 進度筆記
-- Phase 0-2 完成並驗證：5306 行單檔 → lib.rs(358) + 25 模組(全<500)；`-D warnings` 乾淨；
-  22 測試通過；`--help`/`--list-tools`/`--list`/`--probe`(實機) 輸出逐字 IDENTICAL。
-- Phase 3-6 尚未開始（型別化）；已釐清資料流與設計，待續（合併執行 3+4）。
-- 尚未 commit（等使用者指示）。
+## ✅ 全部完成（Phase 0-6）
+- Phase 0-2：5306 行單檔 → lib.rs + 25 模組。commit `cbd73d1`。
+- Phase 4.1/4.2 + 3.1：ProbeReport enum 派發 + StlinkControllerInfo + TargetReport。
+  commits `cfe135d`、`40893c6`。
+- Phase 3.2-3.8：esp/avr/stm32flash/ftdi/dfu/pico/daplink/pyocd 全型別化；
+  `HashMap<String,String>` 已從整個程式碼庫消除。commit `c350fd1`。
+- Phase 4.3 + 5：CLI `Cli` enum + parse；`TargetLink` trait 統一兩個 SWD link。commit `d9933bc`。
+- Phase 6：更新 CLAUDE.md（模組地圖、Extending、tests 位置）。README/`--help` 未受影響。
+
+### 驗證（每階段）
+- `RUSTFLAGS="-D warnings" cargo build --release` 乾淨；`cargo test` 22 通過。
+- `--help`/`--list-tools`/`--list` 與基準逐字 IDENTICAL（`--probe` 在 probe 仍接著時亦 IDENTICAL；
+  中途 CMSIS-DAP probe 被實體拔除後，硬體路徑改以單元測試 + 邏輯保真把關）。
+
+### 已知小偏差
+- `src/swd/cmsisdap.rs` = 506 行（略過 500）：型別化後的 TargetReport 結構建構比 HashMap 略長。
+  要降到 500 以下需把 run_cmsisdap_* 查詢移出並把多個 CmsisDapLink 方法改 pub(crate) 跨模組，
+  風險高於收益，故保留。其餘所有檔案 < 500。
+- 測試仍集中於 `lib.rs` root（未逐一拆入各模組）；被測私有欄位/方法已補 pub(crate)。
