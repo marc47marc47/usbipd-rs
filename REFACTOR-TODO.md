@@ -1,5 +1,11 @@
 # 重構進度追蹤 — 分拆模組 + 完整型別化
 
+> ## ✅ 全部完成（Phase 0–6，含收尾）— 已推送至 `origin/gd32-clone-detect`
+> 5306 行單檔 → `lib.rs`(62) + 26 模組（**全檔 < 500 行**，最大 windows/mod.rs 446）；
+> `HashMap<String,String>` 已從全程式碼消除；22 測試（分佈各模組）全通過；
+> `-D warnings` 乾淨；`--help`/`--list-tools`/`--list` 與基準逐字 IDENTICAL；實機 `--probe` 複驗通過。
+> 最新 commit：`a849e7f`。
+
 > 計畫全文：`C:\Users\marc4\.claude\plans\polymorphic-plotting-pony.md`
 > 目標：`src/bin/usbipd-rs.rs`（5306 行）→ lib.rs + 多個 <500 行模組，並把
 > `HashMap<String,String>` 資料流完整型別化。**行為不得改變**（純重構）。
@@ -34,38 +40,38 @@
 - [x] 2.8 `序` `swd/`（mod 共用、stlink、cmsisdap）
 - [x] 2.9 `序` `windows/`（mod、status）
 - [x] 2.10 `序` `installer/`（mod、tools 表）+ `cmd/mcu_alive.rs`
-- [x] 2.11 `序` 測試：暫保留於 `lib.rs` root（`mod tests`，super::* 解析 crate re-export；被測私有欄位/方法已補 pub(crate)），22 測試全綠。**偏離計畫**：未逐一拆入各模組，留待後續可選。
+- [x] 2.11 `序` 測試已逐一拆入各自模組（`#[cfg(test)] mod tests`，`use crate::*`），`lib.rs` 縮到 62 行，22 測試全綠。
 
 ## ✅ Phase 3 + 4.1/4.2 完成（HashMap<String,String> 已從全程式碼消除）
 > 註：依釐清的耦合，先做了 4.1/4.2（ProbeReport enum 派發），再逐一型別化各報告。
 > 所有 run_*/print_* 改用具名 struct + print 方法；ProbeReport 委派 is_empty/print。
 > 每步驗證：-D warnings 乾淨、22 測試通過、help/list-tools/list 輸出 IDENTICAL。
 
-## Phase 3 — 型別化各報告（分拆後多檔，部分可並行）
-> 每項：新增報告 struct → `run_*` 回傳它 → `parse_*` 填它 → `print_*` 吃它。逐項驗證輸出不變。
-- [ ] 3.1 `序` `stm32/decode.rs`：`TargetReport` 取代 decode_stlink_regs 的 HashMap（含測試遷移）— 收益最大、先做
-- [ ] 3.2 `併` `probe/esp.rs`：`EspInfo`
-- [ ] 3.3 `併` `probe/avr.rs`：`AvrInfo`
-- [ ] 3.4 `併` `probe/stm32flash.rs`：`Stm32FlashInfo`
-- [ ] 3.5 `併` `probe/ftdi.rs`：`FtdiInfo`
-- [ ] 3.6 `併` `probe/dfu.rs`：`DfuInfo`（含 region 列）
-- [ ] 3.7 `併` `probe/pico.rs`：`PicoInfo`
-- [ ] 3.8 `併` `probe/daplink.rs`：`DaplinkInfo` + `PyocdInfo`
-- [ ] 3.9 `併` `stlink/controller.rs`：`StlinkControllerInfo`
+## Phase 3 — 型別化各報告 — ✅ 完成
+> 每項：新增報告 struct → `run_*` 回傳它 → `parse_*` 填它 → `print_*` 改 print 方法。逐項驗證輸出不變。
+- [x] 3.1 `序` `stm32/decode.rs`：`TargetReport` 取代 decode_stlink_regs 的 HashMap（含測試遷移）
+- [x] 3.2 `併` `probe/esp.rs`：`EspInfo`
+- [x] 3.3 `併` `probe/avr.rs`：`AvrInfo`
+- [x] 3.4 `併` `probe/stm32flash.rs`：`Stm32FlashInfo`
+- [x] 3.5 `併` `probe/ftdi.rs`：`FtdiInfo`
+- [x] 3.6 `併` `probe/dfu.rs`：`DfuInfo`（含 region 列）
+- [x] 3.7 `併` `probe/pico.rs`：`PicoInfo`
+- [x] 3.8 `併` `probe/daplink.rs`：`DaplinkInfo` + `PyocdInfo`
+- [x] 3.9 `併` `stlink/controller.rs`：`StlinkControllerInfo`
 
-## Phase 4 — 統一派發與 CLI 型別化（序，動 probe/mod 與 cli）
-- [ ] 4.1 `序` `ProbeReport` enum + `ProbeCtx`；`ProbeKind::run` / `ProbeReport::print` 收掉 probe_boards 巨型 match
-- [ ] 4.2 `序` `ProbeKind::label` 收掉 `cmd_list_usb` 的 label match；`flasher_suggestion` 一併收斂
-- [ ] 4.3 `序` `cli.rs`：`Command` enum + `parse(args)`；`lib.rs::run()` 改 match `Command`
+## Phase 4 — 統一派發與 CLI 型別化 — ✅ 完成
+- [x] 4.1 `序` `ProbeReport` enum + `ProbeCtx`；`ProbeKind::run` / `ProbeReport::print` 收掉 probe_boards 巨型 match
+- [x] 4.2 `序` `ProbeKind::label` 收掉 `cmd_list_usb` 的 label match
+- [x] 4.3 `序` `cli.rs`：`Cli` enum + `parse(args)`；`lib.rs::run()` 改 match（命名 `Cli` 以避開 `std::process::Command` 衝突）
 
-## Phase 5 — SWD 抽象（序）
-- [ ] 5.1 `序` `swd/mod.rs`：`TargetLink` trait（read_mem32 等）；`StlinkLink`/`CmsisDapLink` 各 impl，共用 collect/format
+## Phase 5 — SWD 抽象 — ✅ 完成
+- [x] 5.1 `序` `swd/mod.rs`：`TargetLink` trait（`read_word`）；`StlinkLink`/`CmsisDapLink` 各 impl，`collect_target_regs` 改吃 `&mut dyn TargetLink`
 
-## Phase 6 — 收尾（序）
-- [ ] 6.1 `序` 更新 `CLAUDE.md`：「單一檔案」段落改為新模組地圖與擴充指引
-- [ ] 6.2 `序` 對齊 `README` / `--help`（若受影響）
-- [ ] 6.3 `序` 最終 `cargo build --release`（警告乾淨）+ `cargo test` + 與 Phase 0 基準逐項比對
-- [ ] 6.4 `序` `bash pack-release.sh` 確認打包流程仍動
+## Phase 6 — 收尾 — ✅ 完成
+- [x] 6.1 `序` 更新 `CLAUDE.md`：模組地圖 + 型別化資料流 + Extending（new board/probe/CLI flag/tool）
+- [x] 6.2 `序` `README` / `--help` 未受影響（`--help` 逐字相同）
+- [x] 6.3 `序` 最終 `cargo build --release`（警告乾淨）+ `cargo test`（22 通過）+ 與 Phase 0 基準比對 IDENTICAL
+- [x] 6.4 `序` `bash pack-release.sh` 打包流程正常（二進位名 `usbipd-rs` 不變）
 
 ---
 
