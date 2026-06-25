@@ -1,4 +1,57 @@
 
+use crate::Result;
+
+/// The sub-command selected by the command-line flags. Parsing is centralized
+/// here so `run()` is a single match instead of a flag-checking ladder.
+pub(crate) enum Cli {
+    Help,
+    Version,
+    ListTools,
+    DriverStatus,
+    InstallDriver { confirm: bool },
+    McuAliveNative,
+    McuAlive,
+    Install { tool: String },
+    ListUsb { probe: bool },
+}
+
+/// Map raw args to a `Cli`. Earlier checks win, preserving the historical
+/// flag precedence (e.g. `--help` overrides everything).
+pub(crate) fn parse(args: &[String]) -> Result<Cli> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        return Ok(Cli::Help);
+    }
+    if args.iter().any(|a| matches!(a.as_str(), "-V" | "--version")) {
+        return Ok(Cli::Version);
+    }
+    if args.iter().any(|a| a == "--list-tools") {
+        return Ok(Cli::ListTools);
+    }
+    if args.iter().any(|a| a == "--driver-status") {
+        return Ok(Cli::DriverStatus);
+    }
+    if args.iter().any(|a| a == "--install-driver") {
+        let confirm = args.iter().any(|a| matches!(a.as_str(), "--confirm" | "--yes" | "-y"));
+        return Ok(Cli::InstallDriver { confirm });
+    }
+    if args.iter().any(|a| a == "--mcu-alive-native") {
+        return Ok(Cli::McuAliveNative);
+    }
+    if args.iter().any(|a| a == "--mcu-alive") {
+        return Ok(Cli::McuAlive);
+    }
+    if let Some(idx) = args.iter().position(|a| a == "--install") {
+        let tool = args.get(idx + 1).map(String::as_str).unwrap_or("");
+        if tool.is_empty() {
+            anyhow::bail!("--install requires a tool name. Try `--list-tools`.");
+        }
+        return Ok(Cli::Install { tool: tool.to_string() });
+    }
+    let probe =
+        args.iter().any(|a| matches!(a.as_str(), "--probe" | "--probe-esp" | "--probe-arduino" | "-p"));
+    Ok(Cli::ListUsb { probe })
+}
+
 pub(crate) fn print_help() {
     let help = r#"usbipd-rs — USB device inspector with chip-level board probing
 

@@ -322,6 +322,12 @@ impl CmsisDapLink {
     }
 }
 
+impl TargetLink for CmsisDapLink {
+    fn read_word(&mut self, addr: u32) -> Result<u32> {
+        self.read_mem32(addr)
+    }
+}
+
 /// Layer 1: identify an RP2040-based CMSIS-DAP debug probe from VID:PID + USB
 /// descriptors (no SWD command issued). Keys match `print_stlink_controller_info`.
 pub(crate) fn run_cmsisdap_controller_query(vid: u16, pid: u16) -> Result<StlinkControllerInfo> {
@@ -431,7 +437,7 @@ pub(crate) fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<TargetRepo
     }
 
     let db = load_chip_db();
-    let (regs, dev_id, resolved) = collect_target_regs(|addr| link.read_mem32(addr), &db);
+    let (regs, dev_id, resolved) = collect_target_regs(&mut link, &db);
     if dev_id.is_none() {
         // The DP answered (we printed a DP IDCODE) but no identity register could
         // be read — the AHB-AP faulted every access. Report this distinctly

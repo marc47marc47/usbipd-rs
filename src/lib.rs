@@ -37,40 +37,23 @@ pub(crate) use installer::*;
 
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-
-    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
-        print_help();
-        return Ok(());
-    }
-    if args.iter().any(|a| matches!(a.as_str(), "-V" | "--version")) {
-        println!("usbipd-rs {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--list-tools") {
-        return cmd_list_tools();
-    }
-    if args.iter().any(|a| a == "--driver-status") {
-        return cmd_driver_status();
-    }
-    if args.iter().any(|a| a == "--install-driver") {
-        let confirm = args.iter().any(|a| matches!(a.as_str(), "--confirm" | "--yes" | "-y"));
-        return cmd_install_driver(confirm);
-    }
-    if args.iter().any(|a| a == "--mcu-alive-native") {
-        return cmd_mcu_alive_native();
-    }
-    if args.iter().any(|a| a == "--mcu-alive") {
-        return cmd_mcu_alive();
-    }
-    if let Some(idx) = args.iter().position(|a| a == "--install") {
-        let tool = args.get(idx + 1).map(String::as_str).unwrap_or("");
-        if tool.is_empty() {
-            anyhow::bail!("--install requires a tool name. Try `--list-tools`.");
+    match cli::parse(&args)? {
+        Cli::Help => {
+            print_help();
+            Ok(())
         }
-        return cmd_install(tool);
+        Cli::Version => {
+            println!("usbipd-rs {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Cli::ListTools => cmd_list_tools(),
+        Cli::DriverStatus => cmd_driver_status(),
+        Cli::InstallDriver { confirm } => cmd_install_driver(confirm),
+        Cli::McuAliveNative => cmd_mcu_alive_native(),
+        Cli::McuAlive => cmd_mcu_alive(),
+        Cli::Install { tool } => cmd_install(&tool),
+        Cli::ListUsb { probe } => cmd_list_usb(probe),
     }
-
-    cmd_list_usb()
 }
 
 pub(crate) fn value_or_dash(value: &str) -> &str {

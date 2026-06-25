@@ -222,3 +222,9 @@ impl StlinkLink {
         le_u32(&r, 4).context("short debug-reg response")
     }
 }
+
+impl TargetLink for StlinkLink {
+    fn read_word(&mut self, addr: u32) -> Result<u32> {
+        self.read_debug_reg(addr)
+    }
+}

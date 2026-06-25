@@ -1,10 +1,7 @@
 use crate::*;
 
 pub(crate) const HEADERS: [&str; 4] = ["BUSID", "VID:PID", "DEVICE", "SPEED"];
-pub(crate) fn cmd_list_usb() -> Result<()> {
-    let probe = std::env::args()
-        .any(|a| matches!(a.as_str(), "--probe" | "--probe-esp" | "--probe-arduino" | "-p"));
-
+pub(crate) fn cmd_list_usb(probe: bool) -> Result<()> {
     let entries = list_entries()?;
     let nusb_devs = nusb_by_vidpid();
 
