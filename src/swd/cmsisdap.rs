@@ -364,48 +364,51 @@ pub(crate) fn run_cmsisdap_controller_query(vid: u16, pid: u16) -> Result<Stlink
 
 /// Layer 2: read the downstream SWD target through the CMSIS-DAP probe natively.
 /// Returns keys for `print_stlink_target_info`; auto-detects target presence.
-pub(crate) fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<String, String>> {
-    let mut info = HashMap::new();
+pub(crate) fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<TargetReport> {
+    let mut report = TargetReport::default();
     let probe = nusb::list_devices()
         .wait()
         .ok()
         .and_then(|mut it| it.find(|d| d.vendor_id() == vid && d.product_id() == pid));
     let Some(probe) = probe else {
-        info.insert("Layer 2".into(), "SKIP - CMSIS-DAP USB device not found".into());
-        return Ok(info);
+        report.layer2 = Some("SKIP - CMSIS-DAP USB device not found".into());
+        return Ok(report);
     };
 
     let mut link = match CmsisDapLink::open_device(&probe) {
         Ok(l) => l,
         Err(e) => {
-            info.insert("Layer 2".into(), format!("SKIP - cannot open CMSIS-DAP interface: {e}"));
+            report.layer2 = Some(format!("SKIP - cannot open CMSIS-DAP interface: {e}"));
             #[cfg(windows)]
-            info.insert(
-                "Fix".into(),
-                "bind WinUSB to the 'CMSIS-DAP v2' interface with Zadig (usbipd-rs --install zadig)".into(),
-            );
-            return Ok(info);
+            {
+                report.fix = Some(
+                    "bind WinUSB to the 'CMSIS-DAP v2' interface with Zadig (usbipd-rs --install zadig)".into(),
+                );
+            }
+            return Ok(report);
         }
     };
-    info.insert("Probe".into(), "CMSIS-DAP v2 (native nusb)".into());
+    report.probe = Some("CMSIS-DAP v2 (native nusb)".into());
 
     let multidrop = match link.bringup() {
         Ok((dpidr, multidrop)) => {
-            info.insert("DP IDCODE".into(), format!("0x{dpidr:08X}{}", if multidrop { " (SWD multidrop)" } else { "" }));
+            report.dp_idcode = Some(format!(
+                "0x{dpidr:08X}{}",
+                if multidrop { " (SWD multidrop)" } else { "" }
+            ));
             multidrop
         }
         Err(e) => {
-            info.insert("Layer 2".into(), format!("none - SWD bring-up failed: {e}"));
-            info.insert(
-                "Hint".into(),
+            report.layer2 = Some(format!("none - SWD bring-up failed: {e}"));
+            report.hint = Some(
                 "CMSIS-DAP probe present but no target answered. Check: target powered; SWDIO/SWCLK/GND wired to the probe; correct SWD pins; NRST not held low.".into(),
             );
-            return Ok(info);
+            return Ok(report);
         }
     };
     if let Err(e) = link.open_mem_ap() {
-        info.insert("Layer 2".into(), format!("partial - DP up but MEM-AP failed: {e}"));
-        return Ok(info);
+        report.layer2 = Some(format!("partial - DP up but MEM-AP failed: {e}"));
+        return Ok(report);
     }
 
     // A multidrop DP is an RP-class part (RP2040 DPIDR 0x0BC12477): identify it
@@ -413,15 +416,18 @@ pub(crate) fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<St
     if multidrop {
         match link.read_mem32(RP2040_SYSINFO_CHIP_ID) {
             Ok(chip_id) => {
-                for (k, v) in rp2040_rows(&mut link, chip_id, multidrop) {
-                    info.insert(k.to_string(), v);
-                }
+                let identity = rp2040_rows(&mut link, chip_id, multidrop);
+                report = TargetReport {
+                    probe: report.probe,
+                    dp_idcode: report.dp_idcode,
+                    ..identity
+                };
             }
             Err(e) => {
-                info.insert("Layer 2".into(), format!("partial - DP/AP up but MEM read failed: {e}"));
+                report.layer2 = Some(format!("partial - DP/AP up but MEM read failed: {e}"));
             }
         }
-        return Ok(info);
+        return Ok(report);
     }
 
     let db = load_chip_db();
@@ -436,29 +442,29 @@ pub(crate) fn run_cmsisdap_target_query(vid: u16, pid: u16) -> Result<HashMap<St
             .err()
             .map(|e| e.to_string())
             .unwrap_or_else(|| "AP read returned no usable value".into());
-        info.insert(
-            "Layer 2".into(),
-            format!("target present but unreadable — Arm SW-DP answered, memory/AP access faulted ({why})"),
-        );
-        info.insert(
-            "Hint".into(),
+        report.layer2 = Some(format!(
+            "target present but unreadable — Arm SW-DP answered, memory/AP access faulted ({why})"
+        ));
+        report.hint = Some(
             "An Arm debug port responded but its memory bus did not (SWD ACK=FAULT). Likely causes: NRST held low \
              (target stuck in reset); target not fully powered (wire VTREF/3V3 + GND); on a Nucleo driven by an \
              EXTERNAL probe, remove the two CN2 (ST-LINK) jumpers so the on-board ST-LINK stops contending, then power \
              the board (USB/E5V); SWDIO/SWCLK swapped; or the chip has debug permanently disabled (STM32 RDP level 2)."
                 .into(),
         );
-        return Ok(info);
+        return Ok(report);
     }
-    for (k, v) in format_target_rows(&regs, dev_id, resolved.as_ref()) {
-        info.insert(k.to_string(), v);
-    }
-    Ok(info)
+    let identity = format_target_rows(&regs, dev_id, resolved.as_ref());
+    Ok(TargetReport {
+        probe: report.probe,
+        dp_idcode: report.dp_idcode,
+        ..identity
+    })
 }
 
 /// Format an RP2040 downstream target's read-only identity from its SYSINFO
 /// CHIP_ID (manufacturer 0x927, part 0x0002) + GITREF + CPUID.
-pub(crate) fn rp2040_rows(link: &mut CmsisDapLink, chip_id: u32, multidrop: bool) -> Vec<(&'static str, String)> {
+pub(crate) fn rp2040_rows(link: &mut CmsisDapLink, chip_id: u32, multidrop: bool) -> TargetReport {
     let part = (chip_id >> 12) & 0xFFFF;
     let revision = (chip_id >> 28) & 0xF;
     let name = if part == 0x0002 { "RP2040" } else { "Raspberry Pi silicon" };
@@ -468,19 +474,27 @@ pub(crate) fn rp2040_rows(link: &mut CmsisDapLink, chip_id: u32, multidrop: bool
         _ => "",
     };
     let mfr = chip_id & 0xFFF;
-    let mut rows = vec![
-        ("Device ID", format!("{name}{stepping} — Raspberry Pi (mfr 0x{mfr:03X}, part 0x{part:04X})")),
-        ("Revision", format!("0x{revision:X}")),
-    ];
+    let mut report = TargetReport {
+        device_id: Some(format!(
+            "{name}{stepping} — Raspberry Pi (mfr 0x{mfr:03X}, part 0x{part:04X})"
+        )),
+        revision: Some(format!("0x{revision:X}")),
+        flash_size: Some("external QSPI (not read over SWD)".to_string()),
+        sram: Some("264 KB".to_string()),
+        transport: Some(format!(
+            "SWD{} (native CMSIS-DAP, read-only)",
+            if multidrop { " multidrop" } else { "" }
+        )),
+        access: Some("Read-only identity registers".to_string()),
+        ..Default::default()
+    };
     if let Ok(cpuid) = link.read_mem32(0xE000ED00) {
-        rows.push(("Core", format!("{} (dual-core; core 0 selected)", cortex_core(cpuid))));
+        report.core = Some(format!("{} (dual-core; core 0 selected)", cortex_core(cpuid)));
     }
     if let Ok(gitref) = link.read_mem32(RP2040_SYSINFO_GITREF) {
-        rows.push(("Identification", format!("bootrom GITREF 0x{gitref:08X}, CHIP_ID 0x{chip_id:08X}")));
+        report.identification = Some(format!(
+            "bootrom GITREF 0x{gitref:08X}, CHIP_ID 0x{chip_id:08X}"
+        ));
     }
-    rows.push(("Flash size", "external QSPI (not read over SWD)".to_string()));
-    rows.push(("SRAM", "264 KB".to_string()));
-    rows.push(("Transport", format!("SWD{} (native CMSIS-DAP, read-only)", if multidrop { " multidrop" } else { "" })));
-    rows.push(("Access", "Read-only identity registers".to_string()));
-    rows
+    report
 }

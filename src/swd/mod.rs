@@ -73,51 +73,48 @@ pub(crate) fn format_target_rows(
     regs: &HashMap<u32, Vec<u32>>,
     dev_id: Option<u16>,
     resolved: Option<&ResolvedChip>,
-) -> Vec<(&'static str, String)> {
-    let mut map = decode_stlink_regs(regs, dev_id);
+) -> TargetReport {
+    let mut report = decode_stlink_regs(regs, dev_id);
     if let Some(r) = resolved {
         if let Some(did) = dev_id {
             // `decode_stlink_regs` already named GD32 clones (which mirror this
             // DEV_ID) as GigaDevice parts — don't clobber that with the generic
             // ST family name from the built-in table / .chip override.
-            let decoded_is_gd32 = map.get("Device ID").is_some_and(|d| d.contains("GD32"));
+            let decoded_is_gd32 = report.device_id.as_deref().is_some_and(|d| d.contains("GD32"));
             if !decoded_is_gd32 {
-                map.insert("Device ID".into(), format!("0x{:03X} — {}", did, r.name));
+                report.device_id = Some(format!("0x{:03X} — {}", did, r.name));
             }
         }
         if let Some(kb) = r.sram_kb {
-            map.insert("SRAM".into(), format!("{kb} KB"));
+            report.sram = Some(format!("{kb} KB"));
         }
         // Flash + RDP fallback for a model the built-in table doesn't cover
         // (decode only reads those for built-in families).
-        if !map.contains_key("Flash size") {
+        if report.flash_size.is_none() {
             if let Some(kb) = r.flash_size_addr.and_then(|a| regs.get(&a)).and_then(|w| w.first()).copied() {
                 if kb != 0 && kb != 0xFFFF {
-                    map.insert("Flash size".into(), format!("{kb} KB"));
-                    map.insert("Flash map".into(), format!("0x08000000-0x{:08X}", 0x08000000u32 + kb * 1024 - 1));
+                    report.flash_size = Some(format!("{kb} KB"));
+                    report.flash_map = Some(format!("0x08000000-0x{:08X}", 0x08000000u32 + kb * 1024 - 1));
                 }
             }
         }
-        if !map.contains_key("Read protection") {
+        if report.read_protection.is_none() {
             if let (Some(addr), Some(kind)) = (r.rdp_addr, r.rdp_kind) {
                 if let Some(opt) = regs.get(&addr).and_then(|w| w.first()).copied() {
-                    map.insert("Read protection".into(), decode_rdp(opt, kind));
+                    report.read_protection = Some(decode_rdp(opt, kind));
                 }
             }
         }
-        map.insert("Source".into(), r.source.clone());
+        report.source = Some(r.source.clone());
     }
     // The native path doesn't set a fixed SWD clock; correct decode's default.
-    if map.contains_key("Transport") {
-        map.insert("Transport".into(), "SWD (native nusb, read-only)".into());
+    if report.transport.is_some() {
+        report.transport = Some("SWD (native nusb, read-only)".into());
     }
-    [
-        "Device ID", "Revision", "Vendor", "Core", "Architecture", "Max clock", "Flash size",
-        "Flash map", "SRAM", "Unique ID", "Read protection", "Transport", "Access", "Source",
-    ]
-    .iter()
-    .filter_map(|k| map.get(*k).map(|v| (*k, v.clone())))
-    .collect()
+    // The rows path historically omits the Identification row (kept only on the
+    // RP2040 path); preserve that.
+    report.identification = None;
+    report
 }
 
 /// Actionable checklist when SWD enters but no target answers (DPIDR fails).

@@ -192,7 +192,8 @@ pub(crate) fn cmd_mcu_alive_native() -> Result<()> {
         }
 
         let (regs, dev_id, resolved) = stlink_read_regs(&mut link, &chip_db);
-        let rows = format_target_rows(&regs, dev_id, resolved.as_ref());
+        let report = format_target_rows(&regs, dev_id, resolved.as_ref());
+        let rows = report.identity_rows();
         println!("Step 7 - target identity (read-only):");
         if rows.is_empty() {
             println!("  (no identity registers read — no SWD target answered)");

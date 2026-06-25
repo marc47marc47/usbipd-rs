@@ -21,16 +21,18 @@ pub(crate) enum ProbeReport {
     Daplink(HashMap<String, String>),
     Pyocd(HashMap<String, String>),
     StlinkController(StlinkControllerInfo),
-    Target(HashMap<String, String>),
+    Target(TargetReport),
 }
 
 impl ProbeReport {
     pub(crate) fn is_empty(&self) -> bool {
         use ProbeReport::*;
         match self {
-            Esp(m) | Avr(m) | Stm32Flash(m) | Dfu(m) | Ftdi(m) | Pico(m) | Daplink(m) | Pyocd(m)
-            | Target(m) => m.is_empty(),
+            Esp(m) | Avr(m) | Stm32Flash(m) | Dfu(m) | Ftdi(m) | Pico(m) | Daplink(m) | Pyocd(m) => {
+                m.is_empty()
+            }
             StlinkController(i) => i.is_empty(),
+            Target(t) => t.is_empty(),
         }
     }
 
@@ -45,7 +47,7 @@ impl ProbeReport {
             ProbeReport::Daplink(m) => print_daplink_info(m, board),
             ProbeReport::Pyocd(m) => print_pyocd_info(m),
             ProbeReport::StlinkController(i) => i.print(),
-            ProbeReport::Target(m) => print_stlink_target_info(m, board),
+            ProbeReport::Target(t) => t.print(board),
         }
     }
 }

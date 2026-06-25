@@ -105,12 +105,12 @@ mod tests {
 
         let info = decode_stlink_regs(&regs, Some(0x421));
 
-        assert!(info["Device ID"].contains("STM32F446"));
-        assert!(info["Core"].contains("Cortex-M4"));
-        assert_eq!(info["Flash size"], "512 KB");
-        assert_eq!(info["Flash map"], "0x08000000-0x0807FFFF");
-        assert!(info["Read protection"].contains("Disabled"));
-        assert_eq!(info["Access"], "Read-only identity registers");
+        assert!(info.device_id.as_deref().unwrap().contains("STM32F446"));
+        assert!(info.core.as_deref().unwrap().contains("Cortex-M4"));
+        assert_eq!(info.flash_size.as_deref(), Some("512 KB"));
+        assert_eq!(info.flash_map.as_deref(), Some("0x08000000-0x0807FFFF"));
+        assert!(info.read_protection.as_deref().unwrap().contains("Disabled"));
+        assert_eq!(info.access.as_deref(), Some("Read-only identity registers"));
     }
 
     fn node(status: &str, problem: &str, service: &str) -> WindowsUsbDriverNode {
@@ -271,8 +271,8 @@ option_base 0x40023c14
         regs.insert(0xE000ED00, vec![0x410FC241]); // CPUID: Cortex-M4
         regs.insert(0xE0042000, vec![0x10010421]); // DBGMCU: DEV_ID 0x421 = F446
         let info = decode_stlink_regs(&regs, Some(0x421));
-        assert!(info["Device ID"].contains("STM32F446"));
-        assert!(info["Core"].contains("Cortex-M4"));
+        assert!(info.device_id.as_deref().unwrap().contains("STM32F446"));
+        assert!(info.core.as_deref().unwrap().contains("Cortex-M4"));
     }
 
     #[test]
@@ -284,11 +284,11 @@ option_base 0x40023c14
         regs.insert(0xE0042000, vec![0x20036410]); // DBGMCU: DEV_ID 0x410, REV_ID 0x2003
         regs.insert(0x1FFFF7E0, vec![64]); // F1 flash-size register: 64 KB
         let info = decode_stlink_regs(&regs, Some(0x410));
-        assert!(info["Device ID"].contains("STM32F1 medium-density"));
-        assert!(info["Core"].contains("Cortex-M3"));
-        assert_eq!(info["Flash size"], "64 KB");
-        assert!(info["Revision"].contains("rev 1/2/3/X/Y"));
-        assert!(!info.contains_key("Vendor")); // genuine ST REV_ID → no clone flag
+        assert!(info.device_id.as_deref().unwrap().contains("STM32F1 medium-density"));
+        assert!(info.core.as_deref().unwrap().contains("Cortex-M3"));
+        assert_eq!(info.flash_size.as_deref(), Some("64 KB"));
+        assert!(info.revision.as_deref().unwrap().contains("rev 1/2/3/X/Y"));
+        assert!(info.vendor.is_none()); // genuine ST REV_ID → no clone flag
     }
 
     #[test]
@@ -302,18 +302,19 @@ option_base 0x40023c14
         regs.insert(0x1FFFF7E0, vec![512]); // F1 high-density flash-size word: 512 KB
         let info = decode_stlink_regs(&regs, Some(0x414));
         // Leads with the GD32 model, NOT the ST family name.
-        assert!(info["Device ID"].contains("GD32F103xE"));
-        assert!(info["Device ID"].contains("GD32F103RET6"));
-        assert!(!info["Device ID"].contains("STM32"));
-        assert!(info["Max clock"].contains("108 MHz"));
-        let vendor = info.get("Vendor").expect("GD32 provenance noted");
+        let device_id = info.device_id.as_deref().unwrap();
+        assert!(device_id.contains("GD32F103xE"));
+        assert!(device_id.contains("GD32F103RET6"));
+        assert!(!device_id.contains("STM32"));
+        assert!(info.max_clock.as_deref().unwrap().contains("108 MHz"));
+        let vendor = info.vendor.as_deref().expect("GD32 provenance noted");
         assert!(vendor.contains("GigaDevice") && vendor.contains("0x1309"));
 
         // A genuine high-density REV_ID must stay STM32 with no GD32 claim.
         regs.insert(0xE0042000, vec![0x10000414]);
         let genuine = decode_stlink_regs(&regs, Some(0x414));
-        assert!(genuine["Device ID"].contains("STM32F1 high-density"));
-        assert!(!genuine.contains_key("Vendor"));
+        assert!(genuine.device_id.as_deref().unwrap().contains("STM32F1 high-density"));
+        assert!(genuine.vendor.is_none());
     }
 
     #[test]
@@ -337,11 +338,11 @@ option_base 0x40023c14
         regs.insert(0xE0042000, vec![0x13090414]); // DEV_ID 0x414, clone REV_ID 0x1309
         regs.insert(0x1FFFF7E0, vec![512]); // 512 KB → xE
         let resolved = resolve_chip(0x414, &[]).expect("0x414 resolves to built-in STM32");
-        let rows = format_target_rows(&regs, Some(0x414), Some(&resolved));
-        let dev = &rows.iter().find(|(k, _)| *k == "Device ID").unwrap().1;
+        let report = format_target_rows(&regs, Some(0x414), Some(&resolved));
+        let dev = report.device_id.as_deref().unwrap();
         assert!(dev.contains("GD32F103xE") && dev.contains("GD32F103RET6"));
         assert!(!dev.contains("STM32"));
-        assert!(rows.iter().any(|(k, v)| *k == "Vendor" && v.contains("GigaDevice")));
+        assert!(report.vendor.as_deref().is_some_and(|v| v.contains("GigaDevice")));
     }
 
     #[test]
