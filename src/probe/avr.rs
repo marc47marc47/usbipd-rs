@@ -54,6 +54,8 @@ impl AvrInfo {
     }
 }
 
+const AVRDUDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 pub(crate) fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<AvrInfo> {
     // Serial bootloader programmers (arduino/wiring/avr109/stk500v1/stk500v2)
     // can read flash/eeprom/signature but NOT fuses — fuse reads return 0
@@ -78,7 +80,7 @@ pub(crate) fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<Avr
     for target in targets {
         for &baud in target.bauds {
             let baud_str = baud.to_string();
-            let output = Command::new("avrdude")
+            let mut child = Command::new("avrdude")
                 .args([
                     "-c", target.programmer,
                     "-p", target.mcu,
@@ -87,8 +89,26 @@ pub(crate) fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<Avr
                     "-F",
                     "-v",
                 ])
-                .output()
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .context("avrdude not found on PATH (install via Arduino IDE, PlatformIO, or scoop install avrdude)")?;
+
+            // A wrong bootloader dialect can make avrdude retry for 40s+
+            // (STK500v1 on a Mega); a successful read takes <1s. Kill it
+            // after AVRDUDE_TIMEOUT so one bad guess can't stall --probe and
+            // leave COM busy for the next attempt.
+            let deadline = std::time::Instant::now() + AVRDUDE_TIMEOUT;
+            let mut timed_out = false;
+            while child.try_wait()?.is_none() {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let output = child.wait_with_output()?;
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -96,7 +116,12 @@ pub(crate) fn run_avrdude_query(port: &str, targets: &[AvrTarget]) -> Result<Avr
             if output.status.success() {
                 return Ok(parse_avrdude_output(&stdout, &stderr, target.mcu));
             }
-            last_err = summarize_avrdude_error(&stderr, target, baud);
+            last_err = if timed_out {
+                format!("{} @ {baud} baud — no sync within {}s (killed)",
+                    target.programmer, AVRDUDE_TIMEOUT.as_secs())
+            } else {
+                summarize_avrdude_error(&stderr, target, baud)
+            };
         }
     }
     anyhow::bail!("{last_err}");

@@ -85,14 +85,26 @@ impl ProbeKind {
 pub(crate) fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
     println!("=== Board Probe ===");
     let serial_ports = serialport::available_ports().unwrap_or_default();
+    let mut unidentified: Vec<(&Entry, &'static KnownBoard)> = Vec::new();
 
-    for (entry, board) in candidates {
+    for &(entry, board) in candidates {
         let (vid, pid) = entry.vidpid_pair();
         // A single COM port carries exactly one chip: once any serial probe
         // (espflash / stm32flash / avrdude) has identified it, the remaining
         // serial probes in this board's pipeline can only fail — skip them
         // silently.
         let mut serial_chip_found = false;
+        // Any probe returned a report → the host already talks to this board,
+        // so driver / flasher install suggestions would only mislead.
+        let mut identified = false;
+        // A generic USB-UART bridge chains several serial probes as guesses
+        // (espflash → stm32flash → avrdude); all but the right one are
+        // expected to fail. Printing those as "Error:" reads like a broken
+        // board, so in this mode a failed guess only shows a transient
+        // "checking …" line, and failures are reported only if nothing synced.
+        let serial_guesses = board.probes.iter().filter(|p| p.needs_serial_port()).count() > 1;
+        let mut guess_failures: Vec<(&str, String)> = Vec::new();
+        let mut guess_port: Option<String> = None;
 
         for &probe in board.probes {
             let needs_port = probe.needs_serial_port();
@@ -131,17 +143,42 @@ pub(crate) fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 Some(p) => p,
                 None => entry.vidpid.as_str(),
             };
-            println!(
+            let header = format!(
                 "\n[{}  {}  {}  via {}]",
                 entry.busid, board.name, header_port, probe.tool_name()
             );
-
             let ctx = ProbeCtx { vid, pid, port: port_name.as_deref() };
+
+            if needs_port && serial_guesses {
+                let status = format!(
+                    "  checking {} on {header_port} ...",
+                    probe.tool_name()
+                );
+                show_status(&status);
+                let result = probe.run(&ctx);
+                clear_status(&status);
+                match result {
+                    Ok(report) if !report.is_empty() => {
+                        serial_chip_found = true;
+                        identified = true;
+                        println!("{header}");
+                        report.print(board.name);
+                    }
+                    Ok(_) => guess_failures
+                        .push((probe.tool_name(), "no info parsed from output".into())),
+                    Err(e) => guess_failures.push((probe.tool_name(), e.to_string())),
+                }
+                guess_port = port_name;
+                continue;
+            }
+
+            println!("{header}");
             match probe.run(&ctx) {
                 Ok(report) if !report.is_empty() => {
                     if needs_port {
                         serial_chip_found = true;
                     }
+                    identified = true;
                     report.print(board.name);
                 }
                 Ok(_) => println!("  (no info parsed from output)"),
@@ -157,9 +194,51 @@ pub(crate) fn probe_boards(candidates: &[(&Entry, &'static KnownBoard)]) {
                 }
             }
         }
+
+        // No serial guess synced: now the failures are the answer, so list
+        // them (they carry hints such as stm32flash's BOOT0 instructions).
+        if serial_guesses && !serial_chip_found && !guess_failures.is_empty() {
+            println!(
+                "\n[{}  {}  {}]  no bootloader answered",
+                entry.busid, board.name, guess_port.as_deref().unwrap_or(&entry.vidpid)
+            );
+            for (tool, msg) in &guess_failures {
+                let mut lines = msg.lines();
+                if let Some(first) = lines.next() {
+                    println!("  {tool}: {first}");
+                    for line in lines {
+                        println!("  {:width$}  {line}", "", width = tool.len());
+                    }
+                }
+            }
+        }
+        if !identified {
+            unidentified.push((entry, board));
+        }
     }
 
-    print_probe_install_suggestions(candidates);
+    if !unidentified.is_empty() {
+        print_probe_install_suggestions(&unidentified);
+    }
+}
+
+/// Transient progress line for a serial guess; only on a real terminal so
+/// piped/redirected output stays clean.
+fn show_status(status: &str) {
+    use std::io::{IsTerminal, Write};
+    if std::io::stdout().is_terminal() {
+        print!("{status}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Erase the line written by `show_status` (overwrite with spaces, return).
+fn clear_status(status: &str) {
+    use std::io::{IsTerminal, Write};
+    if std::io::stdout().is_terminal() {
+        print!("\r{:width$}\r", "", width = status.len());
+        let _ = std::io::stdout().flush();
+    }
 }
 
 /// The driver a detected board needs so the host can talk to it (Windows only;

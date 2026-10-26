@@ -137,10 +137,13 @@ pub(crate) const BRIDGE: &[ProbeKind] = &[
     ProbeKind::Stm32Flash,
     ProbeKind::Avrdude {
         targets: &[
+            // Mega first: a non-Mega board fails STK500v2 getsync in <1s,
+            // whereas STK500v1 ("arduino") retries 10× and stalls for 40s+
+            // on a Mega before giving up.
+            AVR_MEGA,
             // Uno/Nano-class: bootloader baud varies by clone age → try the
             // modern 115200 first, then the legacy 57600.
             AvrTarget { mcu: "atmega328p", programmer: "arduino", bauds: &[115200, 57600] },
-            AVR_MEGA,
         ],
     },
 ];
