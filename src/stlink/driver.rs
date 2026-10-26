@@ -1,3 +1,4 @@
+#[cfg_attr(not(windows), allow(unused_imports))]
 use crate::*;
 
 /// What the ST-Link debug interface's WinUSB binding looks like on Windows.
